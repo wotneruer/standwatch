@@ -6,7 +6,10 @@ namespace StandWatch.Portable;
 
 internal static class Program
 {
-    private const string PayloadVersion = "2026.09.16.4";
+    private static readonly string PayloadVersion = Assembly.GetExecutingAssembly()
+        .GetCustomAttributes<AssemblyMetadataAttribute>()
+        .Single(attribute => attribute.Key == "StandWatchPayloadVersion")
+        .Value ?? "development";
 
     [STAThread]
     private static void Main()

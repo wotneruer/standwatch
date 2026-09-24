@@ -90,3 +90,40 @@ runtime\current
 Після переміщення підтверджені SHA executable та наявність усіх 12 plans,
 20 transactions і 4 backup directories.
 
+## Відтворювана baseline-збірка
+
+Після створення чистого repository виконано:
+
+```text
+npm run release:portable
+```
+
+Перевірено:
+
+- усі 30 unit-тестів;
+- backend SEA build;
+- реальний запуск backend на випадковому loopback port;
+- `/api/ping`;
+- завантаження HTML;
+- синтаксис фактично згенерованого inline browser JavaScript;
+- framework-dependent desktop publish;
+- self-contained desktop publish;
+- payload із backend, desktop, WebView2 runtime files та обома helper scripts;
+- self-contained portable launcher;
+- versioned artifact і SHA manifest.
+
+Baseline portable artifact:
+
+```text
+D:\_Work_\00_Inbox\TMP\RCC\StandWatch\dist\
+  StandWatch-Portable-0.0.0-baseline.20260924.exe
+```
+
+```text
+bytes:   257752400
+sha256:  18EEF151156B3BED1689D7F30B12FB8D5C0C10E40347677C017DBFE660194F3D
+```
+
+Це build artifact для перевірки pipeline, а не команда оновити ним
+`runtime/current`. End-to-end розпакування launcher в окремий smoke-каталог ще
+не виконувалось.

@@ -7,7 +7,9 @@
     "test": "node --test",
     "build:backend": "node build-standwatch-work.mjs",
     "smoke:backend": "node scripts/smoke-backend.mjs standwatch-server.new.exe",
-    "build:desktop": "dotnet publish DesktopHost/StandWatch.Desktop.csproj -c Release -r win-x64 --self-contained false -o _build/desktop",
-    "verify": "npm test && npm run build:backend && npm run smoke:backend && npm run build:desktop"
+    "build:desktop": "dotnet publish DesktopHost/StandWatch.Desktop.csproj -c Release -r win-x64 --self-contained false -p:NuGetAudit=false -o _build/desktop",
+    "verify": "npm test && npm run build:backend && npm run smoke:backend && npm run build:desktop",
+    "package:portable": "node scripts/package-portable.mjs",
+    "release:portable": "npm run verify && npm run package:portable"
   }
 }
