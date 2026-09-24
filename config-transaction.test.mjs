@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { assertRemoteConfigPath, transactionPaths, redactDecisions, containerHealth, isConfigApplyTransactionKind, selectTransactionBaseline, selectLatestConfigBatch } from './config-transaction.mjs';
+import { assertRemoteConfigPath, transactionPaths, redactDecisions, containerHealth, isConfigApplyTransactionKind, isConfigBatchKind, summarizeBatchRollback, selectTransactionBaseline, selectLatestConfigBatch } from './config-transaction.mjs';
 
 test('transaction paths stay beside the target', () => {
   assert.deepEqual(transactionPaths('/usr/local/rscore/volumes/config/appsettings.json', 'tx_123'), {
@@ -75,4 +75,25 @@ test('latest config batch includes terminal operations so UI cannot silently ste
     { id: 'newer-rolled-back', kind: 'config-file-batch', server: 'QA', group: 'rscore', status: 'rolled-back', completedAt: '2026-09-21T10:00:00Z' },
   ], { server: 'QA', group: 'rscore' });
   assert.equal(latest.id, 'newer-rolled-back');
+});
+
+test('batch rollback kinds and progress have durable terminal states', () => {
+  assert.equal(isConfigBatchKind('config-file-batch'), true);
+  assert.equal(isConfigBatchKind('config-file-debug-batch'), true);
+  assert.equal(isConfigBatchKind('config-file-apply'), false);
+  assert.deepEqual(summarizeBatchRollback([
+    { status: 'rolled-back' },
+    { status: 'rollback-failed' },
+    { status: 'applied' },
+  ]), {
+    total: 3,
+    rolledBack: 1,
+    failed: 1,
+    pending: 1,
+    completed: 2,
+    status: 'rollback-partial',
+  });
+  assert.equal(summarizeBatchRollback([{ status: 'rolled-back' }]).status, 'rolled-back');
+  assert.equal(summarizeBatchRollback([{ status: 'rollback-failed' }]).status, 'rollback-failed');
+  assert.equal(summarizeBatchRollback([{ status: 'applied' }]).status, 'rollback-in-progress');
 });

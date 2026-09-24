@@ -225,3 +225,25 @@ StandWatch\
 
 Архів займає приблизно 27 GB і навмисно ще не видаляється: остаточне очищення
 можна виконати після реального тесту config rollback.
+
+## Review runtime 0.0.0-review.20260924.2
+
+У `runtime/current` встановлено payload із backend-owned batch rollback.
+
+```text
+portable sha256: d8204dfb1d2c2073ceebb1d5e0c6227afefc48e9b0f6bd6c04ae3fd7f96b670b
+backend sha256:  97485F7FE8DD410DCD583FC39AA58F4C2388372E762DC0BCB46B5C1116F85C1F
+runtime marker:  0.0.0-review.20260924.2
+```
+
+Попередні program-файли збережено в:
+
+```text
+D:\_Work_\00_Inbox\TMP\RCC\StandWatch\archive\
+  runtime-program-before-review-20260924-2
+```
+
+Локальний runtime smoke підтвердив `/api/ping`, authoritative data directory та
+доступність останнього batch через `/api/reconcile/file/batch/latest`. Під час
+smoke remote state не змінювався. Реальний batch rollback залишається окремим
+ручним gate.

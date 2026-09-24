@@ -33,7 +33,7 @@ import { reconcileYaml, lineDiff as yamlLineDiff, parseYaml } from './yaml-recon
 import { mergeTextHunks, redactMergeDecisions } from './file-merge.mjs';
 import { resolveVerifiedConfigBackup, extractBackupConfigText } from './backup-config-source.mjs';
 import { findAffectedContainers } from './config-apply-safety.mjs';
-import { transactionPaths, redactDecisions, containerHealth, assertTransactionId, isConfigApplyTransactionKind, selectTransactionBaseline, selectLatestConfigBatch } from './config-transaction.mjs';
+import { transactionPaths, redactDecisions, containerHealth, assertTransactionId, isConfigApplyTransactionKind, isConfigBatchKind, summarizeBatchRollback, selectTransactionBaseline, selectLatestConfigBatch } from './config-transaction.mjs';
 import { collectServerRenameBlockers } from './server-state-safety.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1347,7 +1347,8 @@ const server = createServer(async (req, res) => {
       if (!targetServer) return json(res, 404, { ok: false, error: 'сервер не знайдено' });
       const group = String(url.searchParams.get('group') || 'rscore');
       const batch = selectLatestConfigBatch(loadJsonRecords(CONFIG_TRANSACTIONS_DIR), { server: targetServer.name, group });
-      if (!batch || batch.status !== 'applied') {
+      const activeStatuses = ['applied', 'rollback-in-progress', 'rollback-partial', 'rollback-failed'];
+      if (!batch || !activeStatuses.includes(batch.status)) {
         return json(res, 200, { ok: true, available: false,
           latestBatchId: batch?.id || null, latestBatchStatus: batch?.status || null });
       }
@@ -1355,12 +1356,71 @@ const server = createServer(async (req, res) => {
       for (const row of batch.files || []) {
         try {
           const transaction = loadConfigTransaction(row.transactionId);
-          if (isConfigApplyTransactionKind(transaction.kind) && ['applied', 'rollback-failed'].includes(transaction.status)) files.push({ path: transaction.path, transactionId: transaction.id, status: transaction.status });
+          if (isConfigApplyTransactionKind(transaction.kind) && ['applied', 'rollback-in-progress', 'rollback-failed'].includes(transaction.status)) files.push({ path: transaction.path, transactionId: transaction.id, status: transaction.status });
         } catch { /* incomplete row is not rollbackable */ }
       }
       if (!files.length) return json(res, 200, { ok: true, available: false, latestBatchId: batch.id, latestBatchStatus: 'no-active-files' });
       return json(res, 200, { ok: true, available: true, batchId: batch.id,
+        batchStatus: batch.status, rollbackProgress: batch.rollbackProgress || summarizeBatchRollback(batch.files),
         debug: batch.kind === 'config-file-debug-batch', completedAt: batch.completedAt, files });
+    }
+    if (url.pathname === '/api/reconcile/file/batch/rollback' && req.method === 'POST') {
+      const body = await readBody(req);
+      let batch;
+      try { batch = loadConfigTransaction(body.batchId); }
+      catch (e) { return json(res, 404, { ok: false, error: e.message }); }
+      if (!isConfigBatchKind(batch.kind)) return json(res, 409, { ok: false, error: 'це не файловий batch' });
+      const latest = selectLatestConfigBatch(loadJsonRecords(CONFIG_TRANSACTIONS_DIR), { server: batch.server, group: batch.group });
+      if (!latest || latest.id !== batch.id) return json(res, 409, { ok: false, error: 'rollback дозволено лише для останнього файлового batch', latestBatchId: latest?.id || null });
+      if (batch.status === 'rolled-back') return json(res, 200, { ok: true, batchId: batch.id, status: batch.status,
+        progress: batch.rollbackProgress || summarizeBatchRollback(batch.files), files: batch.files, idempotent: true });
+      if (!['applied', 'rollback-in-progress', 'rollback-partial', 'rollback-failed'].includes(batch.status)) {
+        return json(res, 409, { ok: false, error: 'цей batch не доступний для ручного rollback', status: batch.status });
+      }
+      const targetServer = findServer(batch.server);
+      if (!targetServer) return json(res, 409, { ok: false, error: 'сервер batch видалений' });
+      batch.status = 'rollback-in-progress';
+      batch.rollbackStartedAt ||= new Date().toISOString();
+      batch.rollbackAttempt = Number(batch.rollbackAttempt || 0) + 1;
+      batch.rollbackProgress = summarizeBatchRollback(batch.files);
+      saveConfigTransaction(batch);
+      const failures = [];
+      for (const row of [...(batch.files || [])].reverse()) {
+        let transaction;
+        try { transaction = loadConfigTransaction(row.transactionId); }
+        catch (e) { row.status = 'rollback-failed'; row.rollbackError = e.message; failures.push({ path: row.path, error: e.message }); saveConfigTransaction(batch); continue; }
+        if (transaction.batchId !== batch.id || transaction.server !== batch.server || transaction.group !== batch.group || !isConfigApplyTransactionKind(transaction.kind)) {
+          const error = 'транзакція не належить цьому batch';
+          row.status = 'rollback-failed'; row.rollbackError = error; failures.push({ path: row.path, error }); saveConfigTransaction(batch); continue;
+        }
+        if (['rolled-back', 'rolled-back-automatically'].includes(transaction.status)) { row.status = transaction.status; continue; }
+        if (!['applied', 'rollback-in-progress', 'rollback-failed'].includes(transaction.status)) {
+          const error = `транзакція має недоступний статус ${transaction.status}`;
+          row.status = 'rollback-failed'; row.rollbackError = error; failures.push({ path: transaction.path, error }); saveConfigTransaction(batch); continue;
+        }
+        transaction.status = 'rollback-in-progress'; row.status = 'rollback-in-progress';
+        batch.rollbackProgress = { ...summarizeBatchRollback(batch.files), currentPath: transaction.path };
+        saveConfigTransaction(transaction); saveConfigTransaction(batch);
+        try {
+          transaction.rollbackHealth = await remoteRollbackConfig(targetServer, transaction);
+          transaction.status = 'rolled-back'; transaction.rolledBackAt = new Date().toISOString(); delete transaction.rollbackError;
+          row.status = 'rolled-back'; delete row.rollbackError;
+        } catch (e) {
+          transaction.status = 'rollback-failed'; transaction.rollbackError = String(e.message || e).slice(0, 1000);
+          row.status = 'rollback-failed'; row.rollbackError = transaction.rollbackError;
+          failures.push({ path: transaction.path, error: transaction.rollbackError });
+        }
+        saveConfigTransaction(transaction);
+        batch.rollbackProgress = { ...summarizeBatchRollback(batch.files), currentPath: null };
+        saveConfigTransaction(batch);
+      }
+      const summary = summarizeBatchRollback(batch.files);
+      batch.status = summary.status; batch.rollbackProgress = { ...summary, currentPath: null };
+      batch.rollbackCompletedAt = new Date().toISOString(); saveConfigTransaction(batch); reconcileApiCache.clear();
+      const payload = { ok: !failures.length, error: failures.length ? `rollback не завершено для ${failures.length} файл(ів)` : null,
+        batchId: batch.id, status: batch.status, progress: batch.rollbackProgress,
+        files: batch.files, failures, fileOnly: true, restartDeferred: true };
+      return json(res, failures.length ? 500 : 200, payload);
     }
     if (url.pathname === '/api/reconcile/file/batch/apply' && req.method === 'POST') {
       const body = await readBody(req);
@@ -2955,6 +3015,20 @@ async function refreshCurrentPlan(){
   const formButton=document.getElementById('p_execute');formButton.textContent=value.plan&&value.serverUnchanged?'Переформувати план':'Сформувати план';
   return value;
 }
+async function runConfigBatchRollback(batchId,total,detail,button,label='пакета'){
+  if(!confirm('Відкотити всі '+total+' файлів '+label+' до їхніх T2 snapshot? Контейнери не перезапускатимуться.'))return;
+  button.disabled=true;
+  let polling=true;
+  const renderProgress=progress=>{if(!progress)return;const completed=Number(progress.completed||0),count=Number(progress.total||total||0),current=progress.currentPath?'<br><code>'+esc(progress.currentPath)+'</code>':'';detail.innerHTML='<div class="backup-state warn"><b>Відкочую пакет: '+completed+' / '+count+'</b><progress max="'+count+'" value="'+completed+'" style="width:100%;margin-top:8px"></progress>'+current+'<br><span class="muted">Контейнери не змінюються.</span></div>';};
+  const poll=async()=>{while(polling){try{const latest=await apiJson('/api/reconcile/file/batch/latest?server='+encodeURIComponent(current)+'&group='+encodeURIComponent(currentGroup()));if(latest.batchId===batchId&&latest.rollbackProgress)renderProgress(latest.rollbackProgress);}catch{}await new Promise(resolve=>setTimeout(resolve,500));}};
+  const pollingTask=poll();
+  try{
+    const result=await apiJson('/api/reconcile/file/batch/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({batchId})});
+    renderProgress(result.progress);
+    detail.innerHTML='<div class="backup-state ok"><b>✓ Увесь пакет відновлено з T2.</b><br>Файлів: '+esc(result.progress&&result.progress.rolledBack||total)+' · контейнери не змінювалися.</div>';
+  }catch(e){detail.innerHTML='<div class="backup-state bad"><b>Пакетний rollback неповний.</b><br>'+esc(e.message)+'<br>Повторний запуск безпечно продовжить останній batch.</div>';button.disabled=false;}
+  finally{polling=false;await pollingTask;}
+}
 function openCurrentPlan(){
   const value=installerState.currentPlan;if(!value||!value.plan)return;
   const p=value.plan,services=p.services||[],changes=services.filter(x=>x.status==='change'),problems=services.filter(x=>x.status==='unknown'||x.status==='unmanaged'),cmp=p.configComparison||{},cc=cmp.counts||{},pre=p.backupPreflight||{},db=pre.databaseCandidates||[],backup=p.backup||{status:'not-created'},restore=p.restore||{status:'not-tested'};
@@ -2990,7 +3064,7 @@ function openCurrentPlan(){
   const permissionsPath=(packageFiles[0]&&packageFiles[0].path)||(packageCandidates[0]&&packageCandidates[0].path);
   const onlySystemSetupBlocked=(blocked,debugMode)=>blocked.length>0&&blocked.every(file=>file.gates&&file.gates.remoteToolsReady===false&&Object.entries(file.gates).filter(([name,ok])=>!ok&&(!debugMode||name!=='targetDiffers')).every(([name])=>name==='remoteToolsReady'));
   const requestPackageSystemSetup=retry=>{const detail=document.getElementById('plan_config_apply_detail');detail.innerHTML='<div class="backup-state warn"><b>Потрібне одноразове системне налаштування сервера.</b><br>SSH і контейнери вже визначені. Після підтвердження StandWatch сам повторить preflight.</div>';openPermissionsSetup({path:permissionsPath,onSuccess:()=>{detail.innerHTML='<div class="backup-state ok"><b>✓ Сервер підготовлено.</b> Повторюю preflight…</div>';setTimeout(retry,0);}});};
-  apiJson('/api/reconcile/file/batch/latest?server='+encodeURIComponent(current)+'&group='+encodeURIComponent(currentGroup())).then(latest=>{if(!latest.available)return;const detail=document.getElementById('plan_config_apply_detail');if(detail.innerHTML)return;detail.innerHTML='<div class="backup-state ok"><b>Останній файловий пакет застосовано.</b><br>Batch <code>'+esc(latest.batchId)+'</code> · файлів: '+esc(latest.files.length)+'<br><button type="button" id="plan_rollback_latest" class="ghost" style="margin-top:7px">↶ Відкотити весь пакет до T2</button></div>';document.getElementById('plan_rollback_latest').onclick=async event=>{const button=event.currentTarget;if(!confirm('Відкотити всі '+latest.files.length+' файлів пакета до їхніх T2 snapshot? Контейнери не перезапускатимуться.'))return;button.disabled=true;const failures=[];for(const item of [...latest.files].reverse()){try{await apiJson('/api/reconcile/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({transactionId:item.transactionId})});}catch(e){failures.push(item.path+': '+e.message);}}detail.innerHTML=failures.length?'<div class="backup-state bad"><b>Пакетний rollback неповний:</b><br>'+failures.map(esc).join('<br>')+'</div>':'<div class="backup-state ok"><b>✓ Увесь пакет відновлено з T2.</b> Контейнери не змінювалися.</div>';};}).catch(()=>{});
+  apiJson('/api/reconcile/file/batch/latest?server='+encodeURIComponent(current)+'&group='+encodeURIComponent(currentGroup())).then(latest=>{if(!latest.available)return;const detail=document.getElementById('plan_config_apply_detail');if(detail.innerHTML)return;const continuing=latest.batchStatus&&latest.batchStatus!=='applied';detail.innerHTML='<div class="backup-state '+(continuing?'warn':'ok')+'"><b>'+(continuing?'Пакетний rollback потребує продовження.':'Останній файловий пакет застосовано.')+'</b><br>Batch <code>'+esc(latest.batchId)+'</code> · лишилось: '+esc(latest.files.length)+'<br><button type="button" id="plan_rollback_latest" class="ghost" style="margin-top:7px">↶ '+(continuing?'Продовжити rollback':'Відкотити весь пакет до T2')+'</button></div>';document.getElementById('plan_rollback_latest').onclick=event=>runConfigBatchRollback(latest.batchId,latest.rollbackProgress&&latest.rollbackProgress.total||latest.files.length,detail,event.currentTarget,'пакета');}).catch(()=>{});
   packageButton.onclick=async()=>{const detail=document.getElementById('plan_config_apply_detail'),payload={server:current,group:currentGroup(),files:packageFiles};packageButton.disabled=true;detail.innerHTML='<div class="backup-state warn"><b>Пакетний preflight…</b> Перевіряю baseline, live SHA, target і права запису для кожного файла.</div>';
     try{const pre=await apiJson('/api/reconcile/file/batch/prepare',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
       if(!pre.prepareReady){const blocked=(pre.files||[]).filter(file=>!file.ready);packageButton.disabled=false;if(onlySystemSetupBlocked(blocked,false)){requestPackageSystemSetup(()=>packageButton.click());return;}detail.innerHTML='<div class="backup-state bad"><b>Пакет заблоковано.</b><br>'+blocked.map(file=>esc(file.path)+': '+esc(Object.entries(file.gates||{}).filter(([,ok])=>!ok).map(([name])=>name).join(', '))).join('<br>')+'</div>';return;}
@@ -2999,7 +3073,7 @@ function openCurrentPlan(){
       detail.innerHTML='<div class="backup-state warn"><b>Застосовую пакет…</b> T2 → atomic write → SHA verify для кожного файла.</div>';
       const applied=await apiJson('/api/reconcile/file/batch/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
       detail.innerHTML='<div class="backup-state ok"><b>✓ Пакет застосовано: '+esc(applied.applied.length)+' файлів.</b> Контейнери не змінювалися.<br>Batch <code>'+esc(applied.batchId||'—')+'</code>'+(applied.skipped&&applied.skipped.length?'<br>Без змін: '+applied.skipped.map(esc).join(', '):'')+'<br><button type="button" id="plan_rollback_package" class="ghost" style="margin-top:7px">↶ Відкотити весь пакет до T2</button></div>';packageButton.textContent='✓ Пакет застосовано';
-      document.getElementById('plan_rollback_package').onclick=async event=>{const button=event.currentTarget;if(!confirm('Відкотити всі файли пакета до їхніх T2 snapshot? Контейнери не перезапускатимуться.'))return;button.disabled=true;const failures=[];for(const item of [...applied.applied].reverse()){try{await apiJson('/api/reconcile/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({transactionId:item.transactionId})});}catch(e){failures.push(item.path+': '+e.message);}}detail.innerHTML=failures.length?'<div class="backup-state bad"><b>Пакетний rollback неповний:</b><br>'+failures.map(esc).join('<br>')+'</div>':'<div class="backup-state ok"><b>✓ Увесь пакет відновлено з T2.</b> Контейнери не змінювалися.</div>';};
+      document.getElementById('plan_rollback_package').onclick=event=>runConfigBatchRollback(applied.batchId,applied.applied.length,detail,event.currentTarget,'пакета');
     }catch(e){detail.innerHTML='<div class="backup-state bad"><b>Пакет не застосовано:</b> '+esc(e.message)+'</div>';packageButton.disabled=false;}};
   debugPackageButton.onclick=async()=>{const detail=document.getElementById('plan_config_apply_detail'),payload={server:current,group:currentGroup(),files:packageFiles,debugForceWrite:true};debugPackageButton.disabled=true;detail.innerHTML='<div class="backup-state warn"><b>DEBUG preflight усіх файлів…</b> Перевіряю baseline, live SHA, ціль і постійні права для кожного файла.</div>';
     try{const pre=await apiJson('/api/reconcile/file/batch/prepare',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
@@ -3008,7 +3082,7 @@ function openCurrentPlan(){
       payload.debugConfirmation='REWRITE_ALL_MANAGED_FILES';detail.innerHTML='<div class="backup-state warn"><b>DEBUG: перезаписую всі файли…</b> T2 → atomic write → SHA verify для кожного файла.</div>';
       const applied=await apiJson('/api/reconcile/file/batch/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
       detail.innerHTML='<div class="backup-state ok"><b>✓ DEBUG-пакет перезаписано: '+esc(applied.applied.length)+' файлів.</b> Контейнери не змінювалися.<br>Незмінних примусово перезаписано: '+esc(applied.forcedUnchangedCount||0)+'<br>Batch <code>'+esc(applied.batchId||'—')+'</code><br><button type="button" id="plan_rollback_package" class="ghost" style="margin-top:7px">↶ Відкотити весь DEBUG-пакет до T2</button></div>';debugPackageButton.textContent='✓ DEBUG-пакет записано';
-      document.getElementById('plan_rollback_package').onclick=async event=>{const button=event.currentTarget;if(!confirm('Відкотити всі файли DEBUG-пакета до їхніх T2 snapshot? Контейнери не перезапускатимуться.'))return;button.disabled=true;const failures=[];for(const item of [...applied.applied].reverse()){try{await apiJson('/api/reconcile/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({transactionId:item.transactionId})});}catch(e){failures.push(item.path+': '+e.message);}}detail.innerHTML=failures.length?'<div class="backup-state bad"><b>DEBUG rollback неповний:</b><br>'+failures.map(esc).join('<br>')+'</div>':'<div class="backup-state ok"><b>✓ Увесь DEBUG-пакет відновлено з T2.</b> Контейнери не змінювалися.</div>';};
+      document.getElementById('plan_rollback_package').onclick=event=>runConfigBatchRollback(applied.batchId,applied.applied.length,detail,event.currentTarget,'DEBUG-пакета');
     }catch(e){detail.innerHTML='<div class="backup-state bad"><b>DEBUG-пакет не застосовано:</b> '+esc(e.message)+'</div>';debugPackageButton.disabled=false;}};
   document.querySelectorAll('#plan_result_body .rc-file').forEach(a=>a.onclick=e=>{e.preventDefault();openReconcileFor(a.dataset.path);});
   document.querySelectorAll('#plan_result_body .merge-json-file').forEach(a=>a.onclick=e=>{e.preventDefault();openConfigMergeFor(a.dataset.path);});

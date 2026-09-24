@@ -829,3 +829,39 @@ reconcile і autoscan, global TLS bypass та plaintext secrets.
 Ці файли не видаляються під час первинного впорядкування. Спочатку вони
 потрапляють у `archive/legacy-20260924`, а очищення виконується лише після
 перевірки clean build і чинного runtime.
+
+## 11. Durable batch rollback — review.20260924.2
+
+Перед переходом до контейнерів закрито головний дефект DEBUG-пакета: rollback
+більше не є циклом із дев'яти незалежних browser-запитів. Backend отримав одну
+операцію `POST /api/reconcile/file/batch/rollback`, яка:
+
+- приймає лише останній config batch для вибраних server/group;
+- відкочує дочірні file transactions у зворотному порядку;
+- після кожного файла зберігає стан дочірньої транзакції та батьківського batch;
+- має durable стани `rollback-in-progress`, `rollback-partial`,
+  `rollback-failed`, `rolled-back`;
+- повторно продовжує незавершений rollback і не повторює вже відкочені файли;
+- повертає progress, який UI показує одним progress bar із поточним шляхом.
+
+`GET /api/reconcile/file/batch/latest` тепер повертає `batchStatus` та
+`rollbackProgress`, включно з проміжними й помилковими станами. Додано unit-test
+агрегації progress і terminal state; повний набір — `35/35`.
+
+Review artifact:
+
+```text
+D:\_Work_\00_Inbox\TMP\RCC\StandWatch\dist\
+  StandWatch-Portable-0.0.0-review.20260924.2.exe
+sha256: d8204dfb1d2c2073ceebb1d5e0c6227afefc48e9b0f6bd6c04ae3fd7f96b670b
+```
+
+Payload встановлено в `runtime/current`; перед заміною program-файлів створено
+копію `archive/runtime-program-before-review-20260924-2`. Backend SHA:
+`97485F7FE8DD410DCD583FC39AA58F4C2388372E762DC0BCB46B5C1116F85C1F`.
+
+Локально перевірено запуск нового backend і читання реального batch
+`20260923070018239_batch_928f2db8`: статус `applied`, 9 pending files.
+Remote rollback навмисно ще не запускався. Наступний gate — користувацький
+rollback цього batch без restart/recreate контейнерів, а потім перевірка файлів
+і повторна звірка.

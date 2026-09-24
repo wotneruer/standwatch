@@ -74,8 +74,27 @@ export function selectTransactionBaseline(transactions, { server, group, path, l
 
 const CONFIG_BATCH_KINDS = new Set(['config-file-batch', 'config-file-debug-batch']);
 
+export function isConfigBatchKind(kind) {
+  return CONFIG_BATCH_KINDS.has(kind);
+}
+
+export function summarizeBatchRollback(files = []) {
+  const rows = Array.isArray(files) ? files : [];
+  const rolledBack = rows.filter(file => ['rolled-back', 'rolled-back-automatically'].includes(file?.status)).length;
+  const failed = rows.filter(file => file?.status === 'rollback-failed').length;
+  const pending = rows.filter(file => ['applied', 'rollback-in-progress'].includes(file?.status)).length;
+  return {
+    total: rows.length,
+    rolledBack,
+    failed,
+    pending,
+    completed: rolledBack + failed,
+    status: failed ? (rolledBack ? 'rollback-partial' : 'rollback-failed') : pending ? 'rollback-in-progress' : 'rolled-back',
+  };
+}
+
 export function selectLatestConfigBatch(batches, { server, group }) {
   return [...(batches || [])]
-    .filter(value => value && CONFIG_BATCH_KINDS.has(value.kind) && value.server === server && value.group === group)
+    .filter(value => value && isConfigBatchKind(value.kind) && value.server === server && value.group === group)
     .sort((a, b) => String(b.completedAt || b.createdAt || '').localeCompare(String(a.completedAt || a.createdAt || '')))[0] || null;
 }
