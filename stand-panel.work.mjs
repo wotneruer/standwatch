@@ -35,6 +35,7 @@ import { listVerifiedConfigBackups, resolveVerifiedConfigBackup, extractBackupCo
 import { findAffectedContainers } from './config-apply-safety.mjs';
 import { transactionPaths, redactDecisions, containerHealth, assertTransactionId, isConfigApplyTransactionKind, isConfigBatchKind, summarizeBatchRollback, selectTransactionBaseline, selectLatestConfigBatch } from './config-transaction.mjs';
 import { collectServerRenameBlockers } from './server-state-safety.mjs';
+import { buildContainerRolloutPlan } from './container-rollout.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // портативно — усе в data/ біля exe; у dev — звичні шляхи
@@ -214,16 +215,20 @@ function saveInstallerPlan(body) {
     services: (Array.isArray(body.items) ? body.items : []).slice(0, 500).map(x => ({ image: planText(x.image, 200),
       current: planText(x.current, 200), target: planText(x.target, 200), status: planText(x.status, 40), reason: planText(x.reason) })),
     configComparison: { counts: cmp.counts || {}, files: (Array.isArray(cmp.files) ? cmp.files : []).filter(x => x.status !== 'same').slice(0, 1000)
-      .map(x => ({ path: planText(x.path), status: planText(x.status, 40), expectedSize: Number(x.size) || null })) },
+      .map(x => ({ path: planText(x.path), status: planText(x.status, 40), policy: planText(x.policy, 40) || 'managed',
+        secret: !!x.secret, expectedSize: Number(x.size) || null })) },
     backupPreflight: { readOnly: true, disk: pre.disk || null, directories: pre.directories || [],
       containerCount: Array.isArray(pre.containers) ? pre.containers.length : 0, mountCount: Array.isArray(pre.mounts) ? pre.mounts.length : 0,
-      containers: (Array.isArray(pre.containers) ? pre.containers : []).slice(0, 500).map(value => ({ name: planText(value.name, 200), image: planText(value.image, 500),
-        composeGroup: planText(value.composeGroup, 100), workingDir: planText(value.workingDir), databaseCandidate: !!value.databaseCandidate,
+      containers: (Array.isArray(pre.containers) ? pre.containers : []).slice(0, 500).map(value => ({ name: planText(value.name, 200), image: planText(value.image, 500), imageId: planText(value.imageId, 100),
+        composeGroup: planText(value.composeGroup, 100), workingDir: planText(value.workingDir),
+        configFiles: (Array.isArray(value.configFiles) ? value.configFiles : []).slice(0, 100).map(file => planText(file)), databaseCandidate: !!value.databaseCandidate,
         mounts: (Array.isArray(value.mounts) ? value.mounts : []).slice(0, 200).map(mount => ({ type: planText(mount.type, 20), name: planText(mount.name, 300) || null,
           source: planText(mount.source), destination: planText(mount.destination), rw: !!mount.rw })) })),
       databaseCandidates: pre.databaseCandidates || [] },
     backup: { status: 'not-created' }, deploy: { status: 'blocked-until-backup' },
   };
+  plan.containerRollout = buildContainerRolloutPlan({ group, installRoot, services: plan.services,
+    containers: plan.backupPreflight.containers, scopeFiles: plan.target.scopeFiles, configFiles: plan.configComparison.files });
   mkdirSync(PLANS_DIR, { recursive: true });
   const id = `${new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 17)}_${catalogSlug(server.name)}_${catalogSlug(group)}`;
   const target = join(PLANS_DIR, id + '.json'), temporary = target + '.part';
@@ -1781,7 +1786,7 @@ const server = createServer(async (req, res) => {
       const remote = `root='${installRoot}'; group='${group}'; ` +
         `df -Pk "$root" 2>/dev/null | awk 'NR==2 {print "DISK\\t"$2"\\t"$3"\\t"$4"\\t"$6}'; ` +
         `for rel in home scripts volumes; do p="$root/$rel"; if [ -e "$p" ]; then kb=$(du -sk "$p" 2>/dev/null | awk '{print $1}'); printf 'DIR\\t%s\\t%s\\n' "$rel" "${'$'}{kb:-}"; else printf 'DIR\\t%s\\t\\n' "$rel"; fi; done; ` +
-        `ids=$(docker ps -aq); [ -z "$ids" ] || docker inspect --format '{{.Name}}\t{{.Config.Image}}\t{{index .Config.Labels "com.docker.compose.project"}}\t{{index .Config.Labels "com.docker.compose.project.working_dir"}}\t{{json .Mounts}}' $ids`;
+        `ids=$(docker ps -aq); [ -z "$ids" ] || docker inspect --format '{{.Name}}\t{{.Config.Image}}\t{{index .Config.Labels "com.docker.compose.project"}}\t{{index .Config.Labels "com.docker.compose.project.working_dir"}}\t{{index .Config.Labels "com.docker.compose.project.config_files"}}\t{{.Image}}\t{{json .Mounts}}' $ids`;
       const result = await sshRun(targetServer.ssh, resolveSshSettings(targetServer).sshKey, [remote], { timeout: 120000 });
       let disk = null; const directories = [], containers = [];
       for (const line of String(result.stdout || '').split(/\r?\n/)) {
@@ -1789,12 +1794,14 @@ const server = createServer(async (req, res) => {
         if (parts[0] === 'DISK') disk = { totalKb: Number(parts[1]) || null, usedKb: Number(parts[2]) || null,
           freeKb: Number(parts[3]) || null, mount: parts[4] || null };
         else if (parts[0] === 'DIR') directories.push({ name: parts[1], exists: parts[2] !== '', sizeKb: Number(parts[2]) || null });
-        else if (parts.length >= 5) {
+        else if (parts.length >= 7) {
           const composeGroup = parts[2] === '<no value>' ? null : parts[2], workingDir = parts[3] === '<no value>' ? null : parts[3];
           if (composeGroup !== group && workingDir !== installRoot && !workingDir?.startsWith(installRoot + '/')) continue;
-          let mounts = []; try { mounts = JSON.parse(parts.slice(4).join('\t')) || []; } catch { /* keep empty */ }
+          const configFiles = parts[4] === '<no value>' ? [] : parts[4].split(',').map(value => value.trim()).filter(Boolean);
+          const imageId = parts[5] === '<no value>' ? null : parts[5];
+          let mounts = []; try { mounts = JSON.parse(parts.slice(6).join('\t')) || []; } catch { /* keep empty */ }
           const name = parts[0].replace(/^\//, ''), image = parts[1];
-          containers.push({ name, image, composeGroup, workingDir, databaseCandidate: /(?:postgres|mysql|mariadb|mongo(?:db)?|mssql|oracle)/i.test(name + ' ' + image),
+          containers.push({ name, image, imageId, composeGroup, workingDir, configFiles, databaseCandidate: /(?:postgres|mysql|mariadb|mongo(?:db)?|mssql|oracle)/i.test(name + ' ' + image),
             mounts: mounts.map(m => ({ type: m.Type, name: m.Name || null, source: m.Source || null, destination: m.Destination || null, rw: !!m.RW })) });
         }
       }
@@ -3152,7 +3159,7 @@ async function runConfigBatchRollback(batchId,total,detail,button,label='пак�
 }
 function openCurrentPlan(){
   const value=installerState.currentPlan;if(!value||!value.plan)return;
-  const p=value.plan,services=p.services||[],changes=services.filter(x=>x.status==='change'),problems=services.filter(x=>x.status==='unknown'||x.status==='unmanaged'),cmp=p.configComparison||{},cc=cmp.counts||{},pre=p.backupPreflight||{},db=pre.databaseCandidates||[],backup=p.backup||{status:'not-created'},restore=p.restore||{status:'not-tested'};
+  const p=value.plan,services=p.services||[],changes=services.filter(x=>x.status==='change'),problems=services.filter(x=>x.status==='unknown'||x.status==='unmanaged'),cmp=p.configComparison||{},cc=cmp.counts||{},pre=p.backupPreflight||{},db=pre.databaseCandidates||[],backup=p.backup||{status:'not-created'},restore=p.restore||{status:'not-tested'},rollout=p.containerRollout||null;
   const baselinePoint=p.baselineRestorePoint||(backup.status==='verified'?{id:value.id,createdAt:backup.createdAt}:null);
   document.getElementById('plan_result_id').textContent='· '+value.id;
   const stale=value.serverUnchanged?'':'<div class="plan-result-stale"><b>План застарів:</b> стан сервера змінився після формування.'+(value.changedServices||[]).slice(0,6).map(x=>'<div><code>'+esc(x.image)+'</code>: '+esc(x.planned||'—')+' → '+esc(x.current||'—')+'</div>').join('')+'</div>';
@@ -3161,9 +3168,12 @@ function openCurrentPlan(){
   const filePolicyKey=path=>p.server+'|'+p.group+'|'+p.target.project+'|'+path;
   let configAttention=0,configReviewed=0;
   const fileRows=(cmp.files||[]).slice(0,100).map(x=>{const policy=installerCatalog.filePolicies[filePolicyKey(x.path)]||x.policy||'managed',attention=policy!=='ignored'&&(x.status==='different'||x.status==='missing'),storedReview=configReviewState(x.path),review=storedReview==='selected'&&!completeFileMergeDraft(readFileMergeDraft(x.path))?'':storedReview;if(attention){configAttention++;if(review==='selected'||review==='viewed')configReviewed++;}const reviewClass=policy==='ignored'?'ignored':review==='selected'?'selected':review==='viewed'?'viewed':attention?'pending':'viewed',reviewLabel=policy==='ignored'?'⊘ Ігнорується':review==='selected'?'✓ Рішення вибрано':review==='viewed'?'✓ Переглянуто':attention?'○ До перевірки':'✓ Без дій';const _b=String(x.path).split('/').pop().toLowerCase(),isYaml=_b.endsWith('.yaml')||_b.endsWith('.yml'),isScript=String(x.path).startsWith('scripts/')&&_b.endsWith('.sh'),isJson=_b.endsWith('.json'),isEnv=_b==='.env'||_b.startsWith('.env.')||_b.endsWith('.env'),reconcilable=policy!=='ignored'&&(isJson||isEnv),clickable=(reconcilable||isYaml||isScript)&&policy!=='ignored'&&attention;const lock=x.secret?'<span title="secret-файл: значення маскуються">🔒</span>':'';const linkClass=isYaml?'yaml-file':isScript?'text-file':isJson?'merge-json-file':'rc-file',linkTitle=isEnv?'Переглянути структуру secret-файла без відкриття значень':'Порівняти повні файли та вибрати ціль',actionLabel=isEnv?'Переглянути без секретів →':'Відкрити merge →',action=clickable?'<button type="button" class="file-action '+linkClass+'" data-path="'+escAttr(x.path)+'" title="'+linkTitle+'">⇄ '+actionLabel+'</button>':'';const pathCell='<div class="file-target">'+lock+'<code title="'+escAttr(x.path)+'">'+esc(x.path)+'</code>'+action+'</div>';return'<tr><td>'+pathCell+'</td><td><span class="file-review '+reviewClass+'" data-config-review="'+escAttr(x.path)+'" data-attention="'+(attention?'1':'0')+'" data-review-state="'+escAttr(review)+'">'+esc(reviewLabel)+'</span></td><td><select class="file-policy policy-'+escAttr(policy)+'" title="Політика обробки цього файла" data-file-policy="'+escAttr(x.path)+'"><option value="managed" '+(policy==='managed'?'selected':'')+'>⚙ Керований</option><option value="observe-only" '+(policy==='observe-only'?'selected':'')+'>◉ Лише дивитись</option><option value="ignored" '+(policy==='ignored'?'selected':'')+'>⊘ Ігнорувати</option></select></td></tr>';}).join('');
+  const rolloutBad=!!(rollout&&(rollout.blockers||[]).length),rolloutFull=rollout&&rollout.policy.scope==='full-compose-group';
+  const rolloutHtml=!rollout?'<div class="backup-state warn"><b>Модель rollout ще не зафіксована.</b> Переформуй план: старі плани не містять image IDs і mount scope.</div>':rollout.required?'<div class="backup-state '+(rolloutBad?'bad':'warn')+'"><b>'+(rolloutFull?'Повний recreate compose-групи':'Restart контейнерів зі зміненими конфігами')+': '+esc(rollout.scope&&rollout.scope.containerCount||0)+'</b><br>'+(rolloutFull?'Зміна сервісу/Compose зачіпає всю групу.':'Image не змінюється; restart гарантує перечитування bind-mounted конфігів.')+'<br><span class="muted">'+esc((rollout.scope&&rollout.scope.containers||[]).map(x=>x.name).join(', ')||'контейнери не визначено')+'</span>'+(rolloutBad?'<br><b>Блокери:</b> '+esc(rollout.blockers.join('; ')):'')+'</div>':'<div class="backup-state ok"><b>Контейнерних дій не потрібно.</b>'+(rollout.scriptChanges&&rollout.scriptChanges.length?' Змінені scripts-файли самі по собі не запускаються.':'')+'</div>';
   document.getElementById('plan_result_body').innerHTML=stale+'<div class="plan-result-head"><span class="pill">'+esc(p.status)+'</span><span class="pill">'+esc(p.server)+' · '+esc(p.group)+'</span><span class="pill">'+esc(p.target.project)+' @ '+esc(p.target.commit.shortId)+'</span><span class="pill">'+esc(p.installRoot)+'</span></div>'
     +'<div class="plan-result-section"><h4>Зміни сервісів: '+changes.length+' · проблеми: '+problems.length+'</h4><div class="source-legend"><span class="source-key server">● На сервері зараз</span><span class="source-key installer">◆ Передбачено installer</span></div>'+(serviceRows?'<table class="plan-result-table"><thead><tr><th>Сервіс</th><th class="server-col">● Сервер зараз</th><th class="installer-col">◆ Installer target</th><th>Причина</th></tr></thead><tbody>'+serviceRows+'</tbody></table>':'<span class="muted">Змін немає.</span>')+'</div>'
     +'<div class="plan-result-section"><h4 class="config-title">Конфігурації <span id="config_attention_count" class="review-count attention">потребують уваги: '+configAttention+'</span><span id="config_reviewed_count" class="review-count reviewed">опрацьовано: '+configReviewed+' / '+configAttention+'</span></h4>'+(fileRows?'<table class="plan-result-table config-table"><thead><tr><th>Файл і дія</th><th>Опрацювання</th><th>Політика</th></tr></thead><tbody>'+fileRows+'</tbody></table>':'')+'</div>'
+    +'<div class="plan-result-section"><h4>Контейнерний rollout · dry-run</h4>'+rolloutHtml+'<div class="muted">Виконання ще вимкнено; це зафіксований scope і порядок майбутньої операції.</div></div>'
     +'<div class="plan-result-section"><h4>Backup і відновлення</h4><div>Директорії для архіву: '+esc((pre.directories||[]).map(x=>x.name+' '+(x.exists?'✓':'—')).join(', ')||'—')+'</div><div>Контейнери: '+esc(pre.containerCount||0)+' · mounts: '+esc(pre.mountCount||0)+'</div><div><b>Виявлені DB-контейнери:</b> '+esc(db.map(x=>x.name+' ('+x.image+')').join(', ')||'немає')+'</div>'
     +(backup.status==='verified'?'<div class="backup-state ok"><b>✓ Локальний backup створено і перевірено.</b><br>DB dump: '+esc((backup.database&&backup.database.dumped||[]).join(', ')||'DB не виявлено')+' · артефактів: '+esc((backup.artifacts||[]).length)+'<br><span class="muted">'+esc(backup.directory||'')+'</span></div>':backup.status==='failed'?'<div class="backup-state bad"><b>✕ Backup не створено.</b> '+esc(backup.error||'невідома помилка')+'</div>':'<div class="backup-state warn"><b>⚠ Це лише виявлення.</b> Дані БД ще не збережені; відкат із цього плану поки неможливий.</div>')
     +(baselinePoint?'<div class="backup-state"><b>Зафіксована точка плану:</b> '+esc(new Date(baselinePoint.createdAt).toLocaleString('uk-UA'))+'<br><code>'+esc(baselinePoint.id)+'</code>'+(baselinePoint.snapshotSha256?'<br><span class="muted">snapshot SHA '+esc(baselinePoint.snapshotSha256.slice(0,16))+'…</span>':'')+'</div>':'<div class="backup-state warn"><b>Точка плану ще не зафіксована.</b> Створи backup або вибери verified точку з каталогу.</div>')
