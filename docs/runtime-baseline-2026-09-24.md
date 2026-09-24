@@ -127,3 +127,44 @@ sha256:  18EEF151156B3BED1689D7F30B12FB8D5C0C10E40347677C017DBFE660194F3D
 Це build artifact для перевірки pipeline, а не команда оновити ним
 `runtime/current`. End-to-end розпакування launcher в окремий smoke-каталог ще
 не виконувалось.
+
+## Наступна review-збірка
+
+Після baseline у source виправлено два recovery-дефекти:
+
+- rename сервера блокується, якщо плани/transactions ще посилаються на його
+  display name;
+- latest-batch endpoint більше не переходить до старішого batch, якщо новіший
+  уже terminal/rolled-back.
+
+Зміни зафіксовано commit `acf78ea`, тести: `34/34`. Для них використовується
+version `0.0.0-review.20260924.1`. Review artifact спочатку перевіряється в
+ізольованому каталозі й не встановлюється в `runtime/current` автоматично.
+
+Review portable artifact:
+
+```text
+D:\_Work_\00_Inbox\TMP\RCC\StandWatch\dist\
+  StandWatch-Portable-0.0.0-review.20260924.1.exe
+```
+
+```text
+bytes:   257752400
+sha256:  2D11EB43BE040810C9A8694F390814269F81617D35652C77BEEFF1D30E2782D6
+```
+
+Ізольований end-to-end smoke виконано в:
+
+```text
+D:\_Work_\00_Inbox\TMP\RCC\StandWatch\temp\portable-smoke-20260924-review1
+```
+
+Перевірено:
+
+- launcher створює папку `StandWatch`;
+- `.payload-version` дорівнює `0.0.0-review.20260924.1`;
+- розпаковано 11 payload files плюс marker;
+- desktop запускає bundled backend;
+- `/api/ping` повертає `app=standwatch` і `dataDir` усередині smoke-каталогу;
+- після тесту обидва процеси з тестового каталогу зупинені;
+- `runtime/current` не змінювався.

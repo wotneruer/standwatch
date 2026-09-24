@@ -568,11 +568,27 @@ Source може бути поділений на десятки модулів, 
 
 ## 5. Пропонований порядок робіт
 
+### Статус виконання на 2026-09-24
+
+- етап 0 виконано: чинний runtime зупинено, переміщено без копіювання великих
+  backup у `runtime/current`, зафіксовано SHA та стан останнього DEBUG batch;
+- етап 1 виконано: канонічний source міститься в `repo`, створено Git repository,
+  baseline commit `80e100a` і tag `baseline-2026-09-24`;
+- етап 2 виконано: `npm run release:portable` запускає tests, backend/frontend
+  smoke, desktop build, формування versioned portable artifact і SHA manifest;
+  review launcher також успішно розгорнуто й запущено в ізольованому каталозі;
+- етап 3 частково виконано в commit `acf78ea`: rename із наявною історією
+  блокується, latest-batch більше не відступає до старішої операції, додано
+  regression tests; усього проходять 34 тести;
+- authoritative runtime data: `runtime/current/data`;
+- ще не виконано: оновлення `runtime/current` новою збіркою та користувацький
+  цикл rollback поточного batch;
+- етап 4 не розпочато.
+
 ### Етап 0. Зафіксувати робочий стан
 
+- **Виконано 2026-09-24.**
 - зупинити StandWatch перед файловими переміщеннями;
-- зовнішній review зафіксував, що на момент перевірки desktop і backend були
-  запущені; тому етап 0 ще не розпочато;
 - зробити контрольну копію source, runtime metadata і manifest важливих
   artifacts;
 - записати SHA чинних executable;
@@ -583,6 +599,7 @@ Source може бути поділений на десятки модулів, 
 
 ### Етап 1. Створити чистий repository
 
+- **Виконано 2026-09-24.**
 - створити `repo`;
 - перенести лише актуальний source, tests і документацію;
 - створити `.gitignore`;
@@ -591,6 +608,8 @@ Source може бути поділений на десятки модулів, 
 - не переносити runtime data, secrets та великі artifacts у Git.
 
 ### Етап 2. Єдина команда test/build/package
+
+- **Виконано й перевірено ізольованим launcher smoke 2026-09-24.**
 
 Pipeline:
 
@@ -610,6 +629,9 @@ unit tests
 запускати».
 
 ### Етап 3. Закрити чинні критичні recovery-дефекти
+
+- **Частково виконано:** code/test fixes готові; runtime update та реальний
+  rollback ще не виконані.
 
 До великого mechanical split, але вже після фіксації source у Git і
 відтворюваної збірки:
@@ -714,8 +736,10 @@ approved Plan
 
 1. Немає повністю перевіреного користувацького batch rollback після останнього
    виправлення.
-2. Rename сервера може зробити rollback наявних transactions недоступним.
-3. Latest-batch discovery після rollback може запропонувати попередній пакет.
+2. Rename сервера тимчасово блокується, якщо історія посилається на його ім'я;
+   повне вирішення потребує стабільного `serverId` і міграції persistence.
+3. Latest-batch discovery виправлено й покрито regression tests; потрібна ще
+   перевірка після встановлення нової збірки в runtime.
 4. RabbitMQ named volume не захищений.
 5. Batch apply/rollback не має повного durable state machine.
 6. Local journal і remote T2 можуть втратити зв'язок; без local journal remote
@@ -724,8 +748,9 @@ approved Plan
 8. Merge decisions не є server-side durable/auditable.
 9. JSONC policy між app і helper неузгоджена саме для реальних змін JSONC.
 10. Немає integration/E2E coverage критичних recovery-сценаріїв.
-11. Build/release не є одним відтворюваним процесом.
-12. Source не знаходиться в канонічному Git repository.
+11. Build/release об'єднано в один відтворюваний процес; лишився launcher E2E
+    smoke та формалізація release promotion.
+12. Source перенесено в канонічний Git repository `repo`.
 13. Secrets зберігаються plaintext, а TLS verification вимкнена глобально.
 14. Монолітний backend/frontend файл робить подальше розширення ризиковим.
 15. Portable source має payload version `2026.09.16.4`, а marker чинного
