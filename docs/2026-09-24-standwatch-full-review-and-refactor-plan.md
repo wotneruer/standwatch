@@ -583,6 +583,8 @@ Source може бути поділений на десятки модулів, 
 - authoritative runtime data: `runtime/current/data`;
 - review-збірку встановлено в `runtime/current` із окремою копією попередніх
   program-файлів; authoritative `data` перевірено до/після;
+- workspace очищено до п'яти канонічних каталогів; legacy перенесено в
+  recoverable `archive`, відтворювані build outputs видалено;
 - ще не виконано: користувацький цикл rollback поточного batch;
 - етап 4 не розпочато.
 

@@ -194,3 +194,34 @@ D:\_Work_\00_Inbox\TMP\RCC\StandWatch\archive\
 - desktop стартував із `runtime/current`, backend слухав port 8799, WebView став
   ready; після закриття вікна desktop і backend завершились штатно;
 - жодного config rollback чи іншої remote mutation під час оновлення не було.
+
+## Прибирання workspace
+
+Після успішної збірки, launcher smoke та promotion корінь workspace приведено
+до канонічної структури:
+
+```text
+StandWatch\
+├─ repo\
+├─ runtime\
+├─ dist\
+├─ archive\
+└─ temp\
+```
+
+Виконано:
+
+- 95 legacy root entries переміщено без видалення в
+  `archive/legacy-root-20260924`;
+- ignored build outputs у `repo` видалено через `git clean -fdX`; вони повністю
+  відтворюються командою `npm run release:portable`;
+- `repo` після очищення займає приблизно 1.5 MB без `.git`-сміття збірки;
+- 11 старих `standwatch-server.*.exe` видалено з `runtime/current`; їх копії є
+  в `archive/runtime-program-before-review-20260924-1`;
+- ізольований smoke-каталог видалено, `temp` порожній;
+- baseline portable перенесено в `archive/obsolete-releases-20260924`;
+- у `dist` залишено тільки актуальний review portable і його manifest;
+- у `runtime/current` залишено актуальний payload та authoritative `data`.
+
+Архів займає приблизно 27 GB і навмисно ще не видаляється: остаточне очищення
+можна виконати після реального тесту config rollback.
