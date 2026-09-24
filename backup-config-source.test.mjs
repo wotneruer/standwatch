@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { normalizeBackupEntry, resolveVerifiedConfigBackup } from './backup-config-source.mjs';
+import { listVerifiedConfigBackups, normalizeBackupEntry, resolveVerifiedConfigBackup, restorePointSnapshotSha256 } from './backup-config-source.mjs';
 
 test('normalizeBackupEntry accepts relative paths and rejects traversal', () => {
   assert.equal(normalizeBackupEntry('volumes\\config\\vpo-service\\appsettings.json'), 'volumes/config/vpo-service/appsettings.json');
@@ -29,6 +29,13 @@ test('resolveVerifiedConfigBackup selects newest matching verified installer bac
   add({ id: 'old', ref: '1.7.3', commit: 'f7925511aaaaaaaa', createdAt: '2026-09-16T10:00:00Z' });
   add({ id: 'new', ref: '1.7.3', commit: 'f7925511bbbbbbbb', createdAt: '2026-09-16T11:00:00Z' });
   add({ id: 'other', ref: '1.7.2', commit: 'f3899ec2cccccccc', createdAt: '2026-09-16T12:00:00Z' });
+  add({ id: 'broken', ref: '1.7.3', commit: 'f7925511dddddddd', createdAt: '2026-09-16T13:00:00Z', bytes: 4 });
   const found = resolveVerifiedConfigBackup({ plansDir, backupsDir, serverName: 'Poruch QA', group: 'rscore', binding: { project: 'vpo/installer', ref: '1.7.3' } });
   assert.equal(found.id, 'new');
+  const pinned = resolveVerifiedConfigBackup({ plansDir, backupsDir, serverName: 'Poruch QA', group: 'rscore', binding: { project: 'vpo/installer', ref: '1.7.3', backupId: 'old' } });
+  assert.equal(pinned.id, 'old');
+  assert.equal(resolveVerifiedConfigBackup({ plansDir, backupsDir, serverName: 'Poruch QA', group: 'rscore', binding: { backupId: 'missing' } }), null);
+  assert.match(pinned.manifestSha256, /^[0-9a-f]{64}$/);
+  assert.equal(pinned.snapshotSha256, restorePointSnapshotSha256(pinned.restorePoint));
+  assert.deepEqual(listVerifiedConfigBackups({ plansDir, backupsDir, serverName: 'Poruch QA', group: 'rscore' }).map(item => item.id), ['other', 'new', 'old']);
 });

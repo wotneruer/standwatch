@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 
 const safeJson = path => {
@@ -18,11 +19,21 @@ const matchesBinding = (restorePoint, binding) => {
   });
 };
 
-// Find the newest locally available, recorded-as-verified T0 backup that belongs
-// to the same server/group and the same installer ref/commit. Stored absolute
-// paths are deliberately ignored so a moved portable folder remains safe.
-export function resolveVerifiedConfigBackup({ plansDir, backupsDir, serverName, group, binding }) {
-  if (!existsSync(plansDir) || !existsSync(backupsDir)) return null;
+export function restorePointSnapshotSha256(restorePoint) {
+  const artifacts = (Array.isArray(restorePoint?.artifacts) ? restorePoint.artifacts : []).map(item => ({
+    kind: item.kind || null, name: item.name || null, bytes: Number(item.bytes) || 0, sha256: item.sha256 || null,
+  }));
+  return createHash('sha256').update(JSON.stringify({
+    planId: restorePoint?.planId || null, server: restorePoint?.server || null, group: restorePoint?.group || null,
+    installRoot: restorePoint?.installRoot || null, createdAt: restorePoint?.createdAt || null, artifacts,
+  })).digest('hex');
+}
+
+// List only locally available restore points whose manifest and every recorded
+// artifact still match the verified metadata. Stored absolute paths are
+// deliberately ignored so a moved portable folder remains safe.
+export function listVerifiedConfigBackups({ plansDir, backupsDir, serverName, group }) {
+  if (!existsSync(plansDir) || !existsSync(backupsDir)) return [];
   const candidates = [];
   for (const file of readdirSync(plansDir).filter(name => name.endsWith('.json'))) {
     const id = file.slice(0, -5);
@@ -32,17 +43,38 @@ export function resolveVerifiedConfigBackup({ plansDir, backupsDir, serverName, 
     const restorePointPath = join(directory, 'restore-point.json');
     const restorePoint = safeJson(restorePointPath);
     if (!restorePoint || restorePoint.status !== 'verified' || restorePoint.planId !== id) continue;
-    if (restorePoint.server !== serverName || restorePoint.group !== group || !matchesBinding(restorePoint, binding)) continue;
+    if (restorePoint.server !== serverName || restorePoint.group !== group) continue;
+    const artifacts = Array.isArray(restorePoint.artifacts) ? restorePoint.artifacts : [];
+    if (!artifacts.length) continue;
+    let artifactsValid = true;
+    for (const item of artifacts) {
+      let name;
+      try { name = normalizeBackupEntry(item?.name); } catch { artifactsValid = false; break; }
+      const artifactPath = join(directory, ...name.split('/'));
+      if (!item?.verified || !existsSync(artifactPath)) { artifactsValid = false; break; }
+      const stat = statSync(artifactPath);
+      if (item.bytes && stat.size !== item.bytes) { artifactsValid = false; break; }
+    }
+    if (!artifactsValid) continue;
     const artifact = (restorePoint.artifacts || []).find(item => item.kind === 'stand-files' && item.verified);
     if (!artifact?.name) continue;
-    const archive = join(directory, artifact.name);
-    if (!existsSync(archive)) continue;
-    const stat = statSync(archive);
-    if (artifact.bytes && stat.size !== artifact.bytes) continue;
-    candidates.push({ id, plan, restorePoint, directory, archive, artifact, createdAt: restorePoint.createdAt || plan.createdAt || '' });
+    const archive = join(directory, ...normalizeBackupEntry(artifact.name).split('/'));
+    const manifestSha256 = createHash('sha256').update(readFileSync(restorePointPath)).digest('hex');
+    candidates.push({ id, plan, restorePoint, directory, archive, artifact, manifestSha256,
+      snapshotSha256: restorePointSnapshotSha256(restorePoint),
+      totalBytes: artifacts.reduce((sum, item) => sum + (Number(item.bytes) || 0), 0),
+      createdAt: restorePoint.createdAt || plan.createdAt || '' });
   }
   candidates.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
-  return candidates[0] || null;
+  return candidates;
+}
+
+// Resolve an explicitly pinned restore point, or (for legacy plans only) the
+// newest point matching their installer binding.
+export function resolveVerifiedConfigBackup({ plansDir, backupsDir, serverName, group, binding }) {
+  const candidates = listVerifiedConfigBackups({ plansDir, backupsDir, serverName, group });
+  if (binding?.backupId) return candidates.find(item => item.id === binding.backupId) || null;
+  return candidates.find(item => matchesBinding(item.restorePoint, binding)) || null;
 }
 
 export function normalizeBackupEntry(relativePath) {

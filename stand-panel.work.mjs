@@ -31,7 +31,7 @@ import { searchInstallerProjects, installerRefs, installerCommits, installerSnap
 import { reconcile as reconcileConfig, parseConfig, configFormat, flatten as flattenConfig, buildTarget as buildTargetConfig, materialize as materializeConfig, coerceManualValue, hasJsonComments } from './config-reconcile.mjs';
 import { reconcileYaml, lineDiff as yamlLineDiff, parseYaml } from './yaml-reconcile.mjs';
 import { mergeTextHunks, redactMergeDecisions } from './file-merge.mjs';
-import { resolveVerifiedConfigBackup, extractBackupConfigText } from './backup-config-source.mjs';
+import { listVerifiedConfigBackups, resolveVerifiedConfigBackup, extractBackupConfigText, restorePointSnapshotSha256 } from './backup-config-source.mjs';
 import { findAffectedContainers } from './config-apply-safety.mjs';
 import { transactionPaths, redactDecisions, containerHealth, assertTransactionId, isConfigApplyTransactionKind, isConfigBatchKind, summarizeBatchRollback, selectTransactionBaseline, selectLatestConfigBatch } from './config-transaction.mjs';
 import { collectServerRenameBlockers } from './server-state-safety.mjs';
@@ -256,17 +256,46 @@ function planFileById(id) {
 // Джерело ref/project/installRoot для reconcile/reveal: спершу зафіксований binding,
 // інакше — останній збережений план цієї групи (щоб reconcile працював і без окремого «фіксування»).
 function resolveConfigBinding(server, group) {
+  const latest = latestInstallerPlan(server.name, group);
+  const pinnedBackupId = latest?.plan?.baselineRestorePoint?.id
+    || (latest?.plan?.backup?.status === 'verified' ? latest.id : null);
+  const backupId = latest ? (pinnedBackupId || '__unselected__') : null;
   const b = (server.installerGroups || {})[group];
   if (b && b.project && b.ref)
-    return { project: b.project, ref: b.ref, installRoot: String(b.installRoot || ('/usr/local/' + group)).replace(/\/+$/, ''), source: 'binding' };
-  const latest = latestInstallerPlan(server.name, group), t = latest?.plan?.target;
+    return { project: b.project, ref: b.ref, installRoot: String(b.installRoot || ('/usr/local/' + group)).replace(/\/+$/, ''),
+      backupId, source: 'binding' };
+  const t = latest?.plan?.target;
   if (t && t.project && t.commit?.id)
-    return { project: t.project, ref: t.commit.id, installRoot: String(latest.plan.installRoot || ('/usr/local/' + group)).replace(/\/+$/, ''), source: 'plan' };
+    return { project: t.project, ref: t.commit.id, installRoot: String(latest.plan.installRoot || ('/usr/local/' + group)).replace(/\/+$/, ''),
+      backupId, source: 'plan' };
   return null;
 }
 function persistInstallerPlan(id, plan) {
   const target = planFileById(id), temporary = target + '.part';
   writeFileSync(temporary, JSON.stringify(plan, null, 2)); renameSync(temporary, target);
+}
+function verifiedBackupCatalog(serverName, group) {
+  return listVerifiedConfigBackups({ plansDir: PLANS_DIR, backupsDir: BACKUPS_DIR, serverName, group }).map(item => ({
+    id: item.id, createdAt: item.createdAt, snapshotSha256: item.snapshotSha256,
+    server: item.restorePoint.server, group: item.restorePoint.group, installRoot: item.restorePoint.installRoot,
+    target: { project: item.restorePoint.target?.project || null, ref: item.restorePoint.target?.ref || null,
+      commit: { id: item.restorePoint.target?.commit?.id || null, shortId: item.restorePoint.target?.commit?.shortId || null } },
+    totalBytes: item.totalBytes,
+    artifacts: (item.restorePoint.artifacts || []).map(artifact => ({ kind: artifact.kind, name: artifact.name,
+      bytes: Number(artifact.bytes) || 0, sha256: artifact.sha256 || null, container: artifact.container || null })),
+    database: item.restorePoint.database || null,
+  }));
+}
+function selectPlanRestorePoint({ serverName, group, planId, backupId }) {
+  const latest = latestInstallerPlan(serverName, group);
+  if (!latest?.plan || latest.id !== planId) throw new Error('точку можна вибрати лише для поточного плану');
+  const point = listVerifiedConfigBackups({ plansDir: PLANS_DIR, backupsDir: BACKUPS_DIR, serverName, group })
+    .find(item => item.id === backupId);
+  if (!point) throw new Error('verified точку відновлення не знайдено');
+  latest.plan.baselineRestorePoint = { id: point.id, createdAt: point.createdAt, snapshotSha256: point.snapshotSha256 };
+  persistInstallerPlan(planId, latest.plan);
+  reconcileApiCache.clear(); configSourceCache.clear();
+  return latest.plan.baselineRestorePoint;
 }
 const shellQuote = value => `'${String(value).replace(/'/g, `'\\''`)}'`;
 const configSourceCache = new Map();
@@ -618,6 +647,7 @@ async function createInstallerBackup({ serverName, group, planId }) {
     writeJsonArtifact(manifestPath, restorePoint);
     plan.backup = { status: 'verified', createdAt: completedAt, directory: backupDir, manifest: manifestPath, artifacts,
       database: restorePoint.database, unprotectedVolumes, checksumsVerified: true };
+    plan.baselineRestorePoint = { id: planId, createdAt: completedAt, snapshotSha256: restorePointSnapshotSha256(restorePoint) };
     plan.deploy = { status: 'blocked-until-restore-workflow' };
     persistInstallerPlan(planId, plan);
     Object.assign(job, { status: 'verified', phase: 'done', processedBytes: job.totalBytes, finishedAt: completedAt, updatedAt: completedAt }); backupJobs.set(planId, job);
@@ -1437,8 +1467,12 @@ const server = createServer(async (req, res) => {
       const targets = debugForceWrite ? contexts : contexts.filter(context => context.gates.targetDiffers);
       if (!targets.length) return json(res, 200, { ok: true, status: 'no-changes', fileOnly: true, restartDeferred: true, applied: [], skipped: contexts.map(context => context.path) });
       const batchId = new Date().toISOString().replace(/[-:TZ.]/g, '').slice(0, 17) + '_batch_' + createHash('sha256').update(String(Date.now()) + Math.random()).digest('hex').slice(0, 8);
+      const operationPlan = latestInstallerPlan(targets[0].targetServer.name, targets[0].group);
+      const restorePoint = operationPlan?.plan?.baselineRestorePoint
+        || (operationPlan?.plan?.backup?.status === 'verified' ? { id: operationPlan.id, createdAt: operationPlan.plan.backup.createdAt } : null);
       const batch = { version: 1, id: batchId, kind: debugForceWrite ? 'config-file-debug-batch' : 'config-file-batch', debugForceWrite, status: 'applying', createdAt: new Date().toISOString(),
         server: targets[0].targetServer.name, group: targets[0].group, fileOnly: true, restartDeferred: true,
+        restorePoint,
         files: targets.map(context => ({ path: context.path, status: 'pending' })) };
       saveConfigTransaction(batch);
       const applied = [];
@@ -1447,6 +1481,7 @@ const server = createServer(async (req, res) => {
         const transaction = { version: 2, id, batchId, kind: debugForceWrite ? 'config-file-debug-apply' : 'config-file-apply', debugForceWrite, forcedUnchanged: debugForceWrite && !context.gates.targetDiffers, format: context.format, status: 'applying', createdAt: new Date().toISOString(),
           server: context.targetServer.name, ssh: context.targetServer.ssh, group: context.group, path: context.path,
           installRoot: context.binding.installRoot, backupPlanId: context.baselineSource.id,
+          baselineSource: { id: context.baselineSource.id, kind: context.baselineSource.kind }, restorePoint,
           installer: { project: context.binding.project, ref: context.binding.ref }, hashes: { before: context.hashes.live, target: context.hashes.target },
           remote, containers: [], writeMode: context.prerequisites.writeMode, decisions: redactMergeDecisions(context.decisions), restartDeferred: true };
         saveConfigTransaction(transaction);
@@ -1714,6 +1749,21 @@ const server = createServer(async (req, res) => {
       try {
         const saved = saveInstallerPlan(await readBody(req));
         return json(res, 200, { ok: true, id: saved.id, status: saved.plan.status, file: saved.file });
+      } catch (error) { return json(res, 400, { ok: false, error: error.message }); }
+    }
+    if (url.pathname === '/api/installer/backups' && req.method !== 'POST') {
+      const serverName = String(url.searchParams.get('server') || ''), group = String(url.searchParams.get('group') || 'default');
+      if (!findServer(serverName)) return json(res, 404, { ok: false, error: 'сервер не знайдено' });
+      const latest = latestInstallerPlan(serverName, group);
+      return json(res, 200, { ok: true, server: serverName, group,
+        selectedId: latest?.plan?.baselineRestorePoint?.id || (latest?.plan?.backup?.status === 'verified' ? latest.id : null),
+        points: verifiedBackupCatalog(serverName, group) });
+    }
+    if (url.pathname === '/api/installer/backup/select' && req.method === 'POST') {
+      try {
+        const body = await readBody(req), serverName = String(body.server || ''), group = String(body.group || 'default');
+        const selected = selectPlanRestorePoint({ serverName, group, planId: String(body.planId || ''), backupId: String(body.backupId || '') });
+        return json(res, 200, { ok: true, selected });
       } catch (error) { return json(res, 400, { ok: false, error: error.message }); }
     }
     if (url.pathname === '/api/installer/backup-status' && req.method !== 'POST') {
@@ -2197,6 +2247,7 @@ const PAGE = /* html */ `<!doctype html><html lang="uk"><head><meta charset="utf
   .dlg .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
   #tagDlg{max-width:900px} #t_branch,#t_tag{width:100%}
   #planResultDlg{max-width:920px;width:92%;max-height:88vh}#planResultDlg .dlg{display:flex;flex-direction:column;max-height:88vh}#plan_result_body{overflow:auto;min-height:180px}.plan-result-head{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}.plan-result-head .pill{display:inline-flex;align-items:center;border:1px solid var(--bd);border-radius:999px;padding:4px 8px;background:var(--card)}.plan-result-section{border:1px solid var(--bd);border-radius:8px;padding:10px;margin:8px 0}.plan-result-section h4{margin:0 0 7px}.plan-result-table th{width:auto}.plan-result-table th.server-col{color:#38bdf8}.plan-result-table th.installer-col{color:#c084fc}.plan-result-table td.server-cell{background:color-mix(in srgb,#38bdf8 7%,transparent);border-left:2px solid #38bdf8;padding-left:8px}.plan-result-table td.installer-cell{background:color-mix(in srgb,#c084fc 8%,transparent);border-left:2px solid #c084fc;padding-left:8px}.source-legend{display:flex;gap:8px;flex-wrap:wrap;margin:6px 0 9px}.source-key{display:inline-flex;align-items:center;gap:6px;padding:4px 9px;border-radius:999px;border:1px solid var(--bd);font-size:11px;font-weight:700}.source-key.server{color:#38bdf8;border-color:color-mix(in srgb,#38bdf8 60%,var(--bd));background:color-mix(in srgb,#38bdf8 9%,transparent)}.source-key.installer{color:#c084fc;border-color:color-mix(in srgb,#c084fc 60%,var(--bd));background:color-mix(in srgb,#c084fc 9%,transparent)}.config-title{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.config-title .review-count{display:inline-flex;padding:3px 8px;border:1px solid currentColor;border-radius:999px;font-size:10.5px}.config-title .attention{color:var(--warn);background:color-mix(in srgb,var(--warn) 12%,transparent)}.config-title .reviewed{color:var(--ok);background:color-mix(in srgb,var(--ok) 12%,transparent)}.config-table{table-layout:fixed}.config-table th:first-child{width:auto}.config-table th:nth-child(2){width:132px}.config-table th:nth-child(3){width:160px}.file-target{display:flex;align-items:center;gap:7px;min-width:0}.file-target>code{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.file-action{display:inline-flex;align-items:center;gap:5px;flex:none;padding:5px 8px;border:1px solid color-mix(in srgb,var(--acc) 70%,var(--bd));border-radius:7px;background:color-mix(in srgb,var(--acc) 16%,var(--card));color:var(--fg);font-size:10.5px;font-weight:750;white-space:nowrap;box-shadow:0 0 0 1px color-mix(in srgb,var(--acc) 10%,transparent)}.file-action:hover{background:var(--acc);color:#fff;transform:translateY(-1px)}.file-review{display:inline-flex;align-items:center;gap:4px;padding:4px 8px;border:1px solid currentColor;border-radius:999px;font-size:10.5px;font-weight:800;white-space:nowrap}.file-review.pending{color:var(--warn);background:color-mix(in srgb,var(--warn) 15%,transparent)}.file-review.selected,.file-review.viewed{color:var(--ok);background:color-mix(in srgb,var(--ok) 15%,transparent)}.file-review.ignored{color:var(--mut);background:color-mix(in srgb,var(--mut) 12%,transparent)}.file-policy{width:100%;min-width:0;padding:6px 28px 6px 9px;font-size:11px;font-weight:750;border-width:1px;cursor:pointer}.file-policy.policy-managed{color:#93c5fd;border-color:#3b82f6;background-color:color-mix(in srgb,#3b82f6 13%,var(--card))}.file-policy.policy-observe-only{color:#fcd34d;border-color:#d97706;background-color:color-mix(in srgb,#d97706 13%,var(--card))}.file-policy.policy-ignored{color:#cbd5e1;border-color:#64748b;background-color:color-mix(in srgb,#64748b 13%,var(--card))}.plan-result-stale{border-left:3px solid var(--warn);padding:8px 10px;background:color-mix(in srgb,var(--warn) 8%,var(--card));margin-bottom:9px}.backup-state{margin-top:8px;padding:8px 10px;border-radius:7px;border:1px solid var(--bd)}.backup-state.warn{border-color:var(--warn);color:var(--warn);background:color-mix(in srgb,var(--warn) 8%,var(--card))}.backup-state.ok{border-color:var(--ok);color:var(--ok);background:color-mix(in srgb,var(--ok) 8%,var(--card))}.backup-state.bad{border-color:var(--bad);color:var(--bad);background:color-mix(in srgb,var(--bad) 8%,var(--card))}.backup-progress progress{display:block;width:100%;height:14px;margin:7px 0;accent-color:var(--acc)}.backup-progress .line{display:flex;justify-content:space-between;gap:10px;color:var(--fg)}
+  #backupCatalogDlg{max-width:880px;width:92%;max-height:84vh}#backupCatalogDlg .dlg{display:flex;flex-direction:column;max-height:84vh}.backup-catalog-list{overflow:auto;display:grid;gap:8px;margin-top:10px}.restore-point{display:grid;grid-template-columns:minmax(170px,1fr) minmax(190px,1.3fr) auto;gap:12px;align-items:center;border:1px solid var(--bd);border-radius:8px;padding:10px;background:var(--card)}.restore-point.selected{border-color:var(--ok);background:color-mix(in srgb,var(--ok) 8%,var(--card))}.restore-point .meta{font-size:11px;color:var(--mut);margin-top:4px}.restore-point .sha{font-family:monospace;font-size:10px;color:var(--mut)}@media(max-width:760px){.restore-point{grid-template-columns:1fr}.restore-point button{width:100%}}
   .modal-cols{display:flex;gap:16px;margin-top:8px} .mcol{flex:1;min-width:0}
   @media(max-width:640px){.modal-cols{flex-direction:column}}
   .colh{font-size:12px;font-weight:700;color:var(--acc);text-transform:uppercase;letter-spacing:.03em;border-bottom:1px solid var(--bd);padding-bottom:4px;margin-bottom:6px}
@@ -2368,7 +2419,13 @@ const PAGE = /* html */ `<!doctype html><html lang="uk"><head><meta charset="utf
   <div id="plan_backup_status"></div>
   <div id="plan_restore_status"></div>
   <div id="plan_config_apply_detail"></div>
-  <div class="row"><button class="ghost" id="plan_result_close">Закрити</button><span id="plan_config_apply_status" class="muted" style="font-size:11px"></span><button class="ghost" id="plan_debug_apply_configs">🧪 DEBUG: перезаписати всі файли</button><button id="plan_apply_configs">Застосувати лише зміни…</button><button id="plan_restore_test">Перевірити відновлення БД</button><button id="plan_backup">Створити локальний backup</button></div>
+  <div class="row"><button class="ghost" id="plan_result_close">Закрити</button><span id="plan_config_apply_status" class="muted" style="font-size:11px"></span><button class="ghost" id="plan_backup_catalog">Точки відновлення…</button><button class="ghost" id="plan_debug_apply_configs">🧪 DEBUG: перезаписати всі файли</button><button id="plan_apply_configs">Застосувати лише зміни…</button><button id="plan_restore_test">Перевірити відновлення БД</button><button id="plan_backup">Створити локальний backup</button></div>
+</div></dialog>
+<dialog id="backupCatalogDlg"><div class="dlg">
+  <h3>Точки відновлення <span id="backup_catalog_scope" class="muted"></span></h3>
+  <div class="muted">Показані лише verified точки, для яких на місці всі записані артефакти та збігаються їхні розміри.</div>
+  <div id="backup_catalog_list" class="backup-catalog-list"></div>
+  <div class="row"><button class="ghost" id="backup_catalog_close">Закрити</button></div>
 </div></dialog>
 <aside id="planDlg" hidden><div class="dlg">
   <h3>Звірка з installer <span id="p_server" class="muted"></span></h3>
@@ -3032,6 +3089,7 @@ async function runConfigBatchRollback(batchId,total,detail,button,label='пак�
 function openCurrentPlan(){
   const value=installerState.currentPlan;if(!value||!value.plan)return;
   const p=value.plan,services=p.services||[],changes=services.filter(x=>x.status==='change'),problems=services.filter(x=>x.status==='unknown'||x.status==='unmanaged'),cmp=p.configComparison||{},cc=cmp.counts||{},pre=p.backupPreflight||{},db=pre.databaseCandidates||[],backup=p.backup||{status:'not-created'},restore=p.restore||{status:'not-tested'};
+  const baselinePoint=p.baselineRestorePoint||(backup.status==='verified'?{id:value.id,createdAt:backup.createdAt}:null);
   document.getElementById('plan_result_id').textContent='· '+value.id;
   const stale=value.serverUnchanged?'':'<div class="plan-result-stale"><b>План застарів:</b> стан сервера змінився після формування.'+(value.changedServices||[]).slice(0,6).map(x=>'<div><code>'+esc(x.image)+'</code>: '+esc(x.planned||'—')+' → '+esc(x.current||'—')+'</div>').join('')+'</div>';
   const serviceRows=changes.concat(problems).map(x=>'<tr><td><b>'+esc(x.image)+'</b></td><td class="server-cell"><code>'+esc(x.current||'—')+'</code></td><td class="installer-cell"><code>'+esc(x.target||'—')+'</code></td><td>'+esc(x.reason||x.status)+'</td></tr>').join('');
@@ -3044,10 +3102,13 @@ function openCurrentPlan(){
     +'<div class="plan-result-section"><h4 class="config-title">Конфігурації <span id="config_attention_count" class="review-count attention">потребують уваги: '+configAttention+'</span><span id="config_reviewed_count" class="review-count reviewed">опрацьовано: '+configReviewed+' / '+configAttention+'</span></h4>'+(fileRows?'<table class="plan-result-table config-table"><thead><tr><th>Файл і дія</th><th>Опрацювання</th><th>Політика</th></tr></thead><tbody>'+fileRows+'</tbody></table>':'')+'</div>'
     +'<div class="plan-result-section"><h4>Backup і відновлення</h4><div>Директорії для архіву: '+esc((pre.directories||[]).map(x=>x.name+' '+(x.exists?'✓':'—')).join(', ')||'—')+'</div><div>Контейнери: '+esc(pre.containerCount||0)+' · mounts: '+esc(pre.mountCount||0)+'</div><div><b>Виявлені DB-контейнери:</b> '+esc(db.map(x=>x.name+' ('+x.image+')').join(', ')||'немає')+'</div>'
     +(backup.status==='verified'?'<div class="backup-state ok"><b>✓ Локальний backup створено і перевірено.</b><br>DB dump: '+esc((backup.database&&backup.database.dumped||[]).join(', ')||'DB не виявлено')+' · артефактів: '+esc((backup.artifacts||[]).length)+'<br><span class="muted">'+esc(backup.directory||'')+'</span></div>':backup.status==='failed'?'<div class="backup-state bad"><b>✕ Backup не створено.</b> '+esc(backup.error||'невідома помилка')+'</div>':'<div class="backup-state warn"><b>⚠ Це лише виявлення.</b> Дані БД ще не збережені; відкат із цього плану поки неможливий.</div>')
+    +(baselinePoint?'<div class="backup-state"><b>Зафіксована точка плану:</b> '+esc(new Date(baselinePoint.createdAt).toLocaleString('uk-UA'))+'<br><code>'+esc(baselinePoint.id)+'</code>'+(baselinePoint.snapshotSha256?'<br><span class="muted">snapshot SHA '+esc(baselinePoint.snapshotSha256.slice(0,16))+'…</span>':'')+'</div>':'<div class="backup-state warn"><b>Точка плану ще не зафіксована.</b> Створи backup або вибери verified точку з каталогу.</div>')
     +(restore.status==='restore-tested'?'<div class="backup-state ok"><b>✓ Restore-test пройдено.</b> Dump розгорнуто в ізольований PostgreSQL; roles, databases, extensions і таблиці збігаються.</div>':restore.status==='restore-failed'?'<div class="backup-state bad"><b>✕ Restore-test не пройдено.</b> '+esc(restore.error||'дивись журнал')+'</div>':'')
     +((restore.unprotectedVolumes||backup.unprotectedVolumes||[]).length?'<div class="backup-state warn"><b>⚠ Destructive drill заблоковано:</b> не захищені Docker volumes: '+esc((restore.unprotectedVolumes||backup.unprotectedVolumes).map(x=>x.container+':'+(x.name||x.destination)).join(', '))+'. Потрібна backup/restore policy для кожного.</div>':'')
     +'<div class="muted">Deploy: '+esc(p.deploy&&p.deploy.status)+'</div></div>';
   const backupButton=document.getElementById('plan_backup');
+  const catalogButton=document.getElementById('plan_backup_catalog');catalogButton.textContent='Точки відновлення…';catalogButton.onclick=openBackupCatalog;
+  apiJson('/api/installer/backups?server='+encodeURIComponent(current)+'&group='+encodeURIComponent(currentGroup())).then(data=>{catalogButton.textContent='Точки відновлення: '+data.points.length;}).catch(()=>{});
   backupButton.disabled=!value.serverUnchanged||backup.status==='verified';
   backupButton.textContent=backup.status==='verified'?'✓ Backup готовий':backup.status==='creating'?'Повторити незавершений backup':value.serverUnchanged?'Створити локальний backup':'План застарів — backup заблоковано';
   const restoreButton=document.getElementById('plan_restore_test');restoreButton.hidden=backup.status!=='verified';restoreButton.disabled=!value.serverUnchanged||restore.status==='restore-tested';restoreButton.textContent=restore.status==='restore-tested'?'✓ Restore перевірено':restore.status==='restore-failed'?'Повторити restore-test':'Перевірити відновлення БД';
@@ -3259,6 +3320,19 @@ document.getElementById('p_detect_root').onclick=async()=>{const input=document.
 document.querySelectorAll('.planfilter').forEach(b=>b.onclick=()=>{planFilter=b.dataset.pf;document.querySelectorAll('.planfilter').forEach(x=>x.classList.toggle('active',x===b));renderPlan();});
 document.getElementById('p_view_plan').onclick=openCurrentPlan;document.getElementById('plan_result_close').onclick=()=>document.getElementById('planResultDlg').close();
 const humanBytes=value=>{const n=Number(value)||0;if(n<1024)return n+' B';if(n<1048576)return(n/1024).toFixed(1)+' KiB';if(n<1073741824)return(n/1048576).toFixed(1)+' MiB';return(n/1073741824).toFixed(2)+' GiB';};
+async function openBackupCatalog(){
+  const value=installerState.currentPlan;if(!value||!value.plan)return;
+  const dialog=document.getElementById('backupCatalogDlg'),list=document.getElementById('backup_catalog_list');
+  document.getElementById('backup_catalog_scope').textContent='· '+value.plan.server+' / '+value.plan.group;
+  list.innerHTML='<div class="backup-state warn">Читаю локальний каталог…</div>';dialog.showModal();
+  try{
+    const data=await apiJson('/api/installer/backups?server='+encodeURIComponent(value.plan.server)+'&group='+encodeURIComponent(value.plan.group));
+    if(!data.points.length){list.innerHTML='<div class="backup-state warn">Verified точок для цього сервера та групи немає.</div>';return;}
+    list.innerHTML=data.points.map(point=>{const selected=point.id===data.selectedId,db=(point.artifacts||[]).filter(x=>x.kind==='postgresql-dump').length,files=(point.artifacts||[]).find(x=>x.kind==='stand-files');return '<div class="restore-point '+(selected?'selected':'')+'"><div><b>'+esc(new Date(point.createdAt).toLocaleString('uk-UA'))+'</b><div class="meta"><code>'+esc(point.id)+'</code></div></div><div><b>'+esc((point.target&&point.target.ref)||'installer ref не записано')+'</b> · <code>'+esc((point.target&&point.target.commit&&point.target.commit.shortId)||'—')+'</code><div class="meta">архів файлів '+esc(humanBytes(files&&files.bytes||0))+' · DB dump: '+esc(db)+' · усього '+esc(humanBytes(point.totalBytes))+'</div><div class="sha">snapshot '+esc(point.snapshotSha256.slice(0,16))+'…</div></div><button type="button" data-backup-id="'+esc(point.id)+'" '+(selected?'disabled':'')+'>'+(selected?'✓ Вибрана для плану':'Вибрати для плану')+'</button></div>';}).join('');
+    list.querySelectorAll('button[data-backup-id]').forEach(button=>button.onclick=async()=>{button.disabled=true;try{await apiJson('/api/installer/backup/select',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({server:value.plan.server,group:value.plan.group,planId:value.id,backupId:button.dataset.backupId})});await refreshCurrentPlan();dialog.close();document.getElementById('planResultDlg').close();openCurrentPlan();}catch(e){list.insertAdjacentHTML('afterbegin','<div class="backup-state bad">'+esc(e.message)+'</div>');button.disabled=false;}});
+  }catch(e){list.innerHTML='<div class="backup-state bad">'+esc(e.message)+'</div>';}
+}
+document.getElementById('backup_catalog_close').onclick=()=>document.getElementById('backupCatalogDlg').close();
 const backupPhase=value=>({preflight:'Перевірка плану', 'db-preflight':'Перевірка PostgreSQL', inventory:'Збереження стану контейнерів', 'stand-files':'Підготовка файлів стенду', 'stand-files-archive':'Пакування home / scripts / volumes на сервері', 'stand-files-transfer':'Передача архіву на локальний компʼютер', 'stand-files-verify':'Перевірка локального архіву', 'database-dump':'Створення PostgreSQL dump', 'database-transfer':'Передача PostgreSQL dump', 'database-verify':'Перевірка PostgreSQL dump', finalizing:'Фінальна перевірка checksum', done:'Готово', failed:'Помилка'}[value]||value||'Підготовка');
 async function refreshBackupProgress(planId){
   const job=await apiJson('/api/installer/backup-status?planId='+encodeURIComponent(planId)),status=document.getElementById('plan_backup_status');

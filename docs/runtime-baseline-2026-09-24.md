@@ -247,3 +247,36 @@ D:\_Work_\00_Inbox\TMP\RCC\StandWatch\archive\
 доступність останнього batch через `/api/reconcile/file/batch/latest`. Під час
 smoke remote state не змінювався. Реальний batch rollback залишається окремим
 ручним gate.
+
+## Restore-point catalog — review.20260924.3
+
+Для `Poruch QA / rscore` read-only перевірка чинних runtime data знайшла чотири
+валідні точки відновлення. Failed backup `20260916075428809_poruch_qa_rscore`
+відфільтрований і в каталог не потрапляє.
+
+Найновіша валідна точка:
+
+```text
+id:       20260924111651016_poruch_qa_rscore
+created:  2026-09-24T11:20:01.138Z
+target:   installer 1.7.1
+bytes:    3829556508
+snapshot: fdd8f16c2baacf431dce7ba3e08a2c6810e018711eabbb20670b3d109bbfe611
+```
+
+Перевірка каталогу лише читала локальні manifests/artifacts. Server state і
+config files не змінювались.
+
+Review artifact і встановлений runtime:
+
+```text
+version:         0.0.0-review.20260924.3
+portable sha256: 67da546cb7b1e8bd1dbb88b3c06fc960906df966d58ac883124025542368f109
+backend sha256:  21c6f11e530a149a20a39ea334a18c641db164f91d9adbb37279e35516e3f012
+previous files:  archive/runtime-program-before-review-20260924-3
+```
+
+Після встановлення runtime endpoint повернув 4 точки, вибрану
+`20260924111651016_poruch_qa_rscore` та authoritative data path
+`runtime/current/data`. HTML містить новий каталог. Backend після smoke
+зупинено; remote operations не виконувались.
