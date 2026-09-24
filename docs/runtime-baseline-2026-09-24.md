@@ -168,3 +168,29 @@ D:\_Work_\00_Inbox\TMP\RCC\StandWatch\temp\portable-smoke-20260924-review1
 - `/api/ping` повертає `app=standwatch` і `dataDir` усередині smoke-каталогу;
 - після тесту обидва процеси з тестового каталогу зупинені;
 - `runtime/current` не змінювався.
+
+## Встановлення review-збірки в current runtime
+
+Після успішного ізольованого smoke payload `0.0.0-review.20260924.1`
+встановлено в:
+
+```text
+D:\_Work_\00_Inbox\TMP\RCC\StandWatch\runtime\current
+```
+
+Перед заміною зроблено відновлювану копію 23 попередніх program-файлів:
+
+```text
+D:\_Work_\00_Inbox\TMP\RCC\StandWatch\archive\
+  runtime-program-before-review-20260924-1
+```
+
+Перевірено після копіювання:
+
+- backend SHA збігається з review manifest:
+  `4CE742DC4B2A0187E1ADDE4D4D5FB857A035280D1EF2B468B200EC2F1B4727FE`;
+- marker: `0.0.0-review.20260924.1`;
+- authoritative `data` до і після: 14 069 файлів, 18 842 631 359 bytes;
+- desktop стартував із `runtime/current`, backend слухав port 8799, WebView став
+  ready; після закриття вікна desktop і backend завершились штатно;
+- жодного config rollback чи іншої remote mutation під час оновлення не було.
