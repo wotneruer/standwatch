@@ -1,0 +1,10 @@
+* text=auto
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.sh text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.cs text eol=crlf
+*.csproj text eol=lf
+*.dll binary
+

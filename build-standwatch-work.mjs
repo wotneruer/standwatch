@@ -5,7 +5,6 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
-const RCC = join(ROOT, '..');
 const BUILD = join(ROOT, '_build');
 const EXE = join(ROOT, 'standwatch-server.new.exe');
 mkdirSync(BUILD, { recursive: true });
@@ -15,9 +14,23 @@ function run(cmd, args, options = {}) {
   if (result.status !== 0) process.exit(result.status || 1);
 }
 
-const esbuild = join(RCC, 'node_modules', 'esbuild', 'bin', 'esbuild');
-const postject = join(RCC, 'node_modules', 'postject', 'dist', 'cli.js');
-if (!existsSync(esbuild) || !existsSync(postject)) throw new Error('Build dependencies not found');
+function findDependency(...parts) {
+  let dir = ROOT;
+  for (let depth = 0; depth < 5; depth++) {
+    const candidate = join(dir, 'node_modules', ...parts);
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+const esbuild = findDependency('esbuild', 'bin', 'esbuild');
+const postject = findDependency('postject', 'dist', 'cli.js');
+if (!esbuild || !postject) {
+  throw new Error('Build dependencies not found. Install esbuild and postject in this repository or one of its parent directories.');
+}
 
 run('node', [esbuild, 'stand-panel.work.mjs', '--bundle', '--platform=node', '--format=cjs',
   '--outfile=_build/app.cjs',

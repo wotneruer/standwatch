@@ -4,7 +4,10 @@
   "version": "0.0.0-baseline.20260924",
   "type": "module",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "build:backend": "node build-standwatch-work.mjs",
+    "smoke:backend": "node scripts/smoke-backend.mjs standwatch-server.new.exe",
+    "build:desktop": "dotnet publish DesktopHost/StandWatch.Desktop.csproj -c Release -r win-x64 --self-contained false -o _build/desktop",
+    "verify": "npm test && npm run build:backend && npm run smoke:backend && npm run build:desktop"
   }
 }
-
