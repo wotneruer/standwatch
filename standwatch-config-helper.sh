@@ -2,7 +2,7 @@
 # Root-owned narrow helper for StandWatch file transactions.
 # It can only touch managed JSON/YAML/SH files below /usr/local/<group>/.
 set -eu
-HELPER_VERSION=v3
+HELPER_VERSION=v4
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
 valid_hash() { printf '%s' "$1" | grep -Eq '^[0-9a-f]{64}$'; }
@@ -49,6 +49,22 @@ validate_target() {
   esac
 }
 
+prepare_rollback() {
+  resolve_target "${1:-}"
+  tx=${2:-}; before=${3:-}; expected=${4:-}
+  valid_tx "$tx" || die 'invalid transaction id'
+  valid_hash "$before" || die 'invalid before sha256'
+  valid_hash "$expected" || die 'invalid expected live sha256'
+  tmp="$dir/.${name}.standwatch-${tx}.rollback.tmp"
+  snap="$dir/.${name}.standwatch-${tx}.t2"
+  current=$(sha256sum "$target" | awk '{print $1}')
+  if [ "$current" = "$before" ]; then rollback_state=already-restored; return; fi
+  [ "$current" = "$expected" ] || die 'live sha256 changed after apply; rollback refused'
+  [ -f "$snap" ] || die 'T2 snapshot not found'
+  [ "$(sha256sum "$snap" | awk '{print $1}')" = "$before" ] || die 'T2 snapshot sha256 mismatch'
+  rollback_state=ready
+}
+
 validator_name() {
   case "$kind" in json) json_validator ;; yaml) printf 'js-yaml+sha256' ;; shell) printf 'bash-n' ;; esac
 }
@@ -89,15 +105,13 @@ case "$command" in
     trap - EXIT HUP INT TERM
     printf 'SNAPSHOT=%s\nSHA256=%s\n' "$snap" "$wanted"
     ;;
+  rollback-check)
+    prepare_rollback "$@"
+    printf 'ROLLBACK=%s\nCURRENT_SHA256=%s\n' "$rollback_state" "$current"
+    ;;
   rollback)
-    resolve_target "${1:-}"
-    tx=${2:-}; before=${3:-}
-    valid_tx "$tx" || die 'invalid transaction id'
-    valid_hash "$before" || die 'invalid before sha256'
-    tmp="$dir/.${name}.standwatch-${tx}.rollback.tmp"
-    snap="$dir/.${name}.standwatch-${tx}.t2"
-    [ -f "$snap" ] || die 'T2 snapshot not found'
-    [ "$(sha256sum "$snap" | awk '{print $1}')" = "$before" ] || die 'T2 snapshot sha256 mismatch'
+    prepare_rollback "$@"
+    if [ "$rollback_state" = already-restored ]; then printf 'ROLLBACK=already-restored\nRESTORED_SHA256=%s\n' "$before"; exit 0; fi
     cleanup() { rm -f -- "$tmp" >/dev/null 2>&1 || true; }
     trap cleanup EXIT HUP INT TERM
     cp --preserve=all -- "$snap" "$tmp"
@@ -107,5 +121,5 @@ case "$command" in
     trap - EXIT HUP INT TERM
     printf 'RESTORED_SHA256=%s\n' "$before"
     ;;
-  *) die 'usage: standwatch-config-helper version|check|apply|rollback ...' ;;
+  *) die 'usage: standwatch-config-helper version|check|apply|rollback-check|rollback ...' ;;
 esac

@@ -280,3 +280,21 @@ previous files:  archive/runtime-program-before-review-20260924-3
 `20260924111651016_poruch_qa_rscore` та authoritative data path
 `runtime/current/data`. HTML містить новий каталог. Backend після smoke
 зупинено; remote operations не виконувались.
+
+## Rollback safety — review.20260924.4
+
+Реальний rollback batch `20260923070018239_batch_928f2db8` не запускався на
+helper v3. Перед ним додано compare-and-swap gate у helper v4: live SHA мусить
+дорівнювати target SHA транзакції або вже дорівнювати before SHA. Інший SHA
+блокує весь пакет до першого remote write.
+
+```text
+version:         0.0.0-review.20260924.4
+portable sha256: efa226d28a55e3747950ea512da439e0eb9b01ff9d516db8a3e9fee9c24f0351
+backend sha256:  dd2bbc3dd6180991c92fa29723f0f3444ab60bd17a327d062dd3044fcb631b32
+previous files:  archive/runtime-program-before-review-20260924-4
+```
+
+Runtime `.4` запущено з authoritative data. Read-only helper status:
+`current=v3`, `required=v4`, `outdated=true`. Batch лишається `applied`; remote
+rollback ще не запускався.

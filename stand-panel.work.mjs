@@ -47,7 +47,7 @@ const CONFIG_TRANSACTIONS_DIR = PORTABLE ? join(DATA_DIR, 'config-transactions')
 const backupJobs = new Map();
 const restoreTestJobs = new Map();
 const REMOTE_CONFIG_HELPER = '/usr/local/sbin/standwatch-config-helper';
-const REMOTE_CONFIG_HELPER_VERSION = 'v3';
+const REMOTE_CONFIG_HELPER_VERSION = 'v4';
 const ENV_PATH = ENV_FILE; // токени: dev → корінь/.env, portable → data/config.env
 
 async function stageRemoteConfigHelper(targetServer) {
@@ -867,10 +867,46 @@ printf 'SNAPSHOT=%s\\nSHA256=%s\\n' "$snap" "$actual"`;
   if (result.status !== 0) throw new Error('atomic write: ' + (result.stderr || `exit ${result.status}`));
   return result.stdout;
 }
-async function remoteRollbackConfig(server, transaction) {
+async function requireCurrentRemoteHelper(server) {
+  const result = await sshRun(server.ssh, resolveSshSettings(server).sshKey,
+    [`sudo -n ${shellQuote(REMOTE_CONFIG_HELPER)} version`], { timeout: 30000 });
+  if (result.status !== 0 || !String(result.stdout || '').includes(`helper:${REMOTE_CONFIG_HELPER_VERSION}`)) {
+    const error = new Error(`для безпечного rollback потрібен helper ${REMOTE_CONFIG_HELPER_VERSION}`);
+    error.requiresHelperUpdate = true; error.rollbackPreflight = true;
+    throw error;
+  }
+}
+async function remoteRollbackPreflight(server, transaction) {
   const p = transaction.remote;
   if (transaction.writeMode === 'helper') {
-    const command = `sudo -n ${shellQuote(REMOTE_CONFIG_HELPER)} rollback ${shellQuote(p.target)} ${shellQuote(transaction.id)} ${shellQuote(transaction.hashes.before)}`;
+    await requireCurrentRemoteHelper(server);
+    const command = `sudo -n ${shellQuote(REMOTE_CONFIG_HELPER)} rollback-check ${shellQuote(p.target)} ${shellQuote(transaction.id)} ${shellQuote(transaction.hashes.before)} ${shellQuote(transaction.hashes.target)}`;
+    const result = await sshRun(server.ssh, resolveSshSettings(server).sshKey, [command], { timeout: 120000 });
+    if (result.status !== 0) { const error = new Error('root helper rollback preflight: ' + (result.stderr || `exit ${result.status}`)); error.rollbackPreflight = true; throw error; }
+    return { ok: true, alreadyRestored: String(result.stdout || '').includes('ROLLBACK=already-restored') };
+  }
+  const script = `set -eu
+target=${shellQuote(p.target)}
+snap=${shellQuote(p.snapshot)}
+mode=${shellQuote(transaction.writeMode)}
+before=${shellQuote(transaction.hashes.before)}
+expected=${shellQuote(transaction.hashes.target)}
+run(){ if [ "$mode" = sudo ]; then sudo -n "$@"; else "$@"; fi; }
+current=$(run sha256sum "$target" | awk '{print $1}')
+if [ "$current" = "$before" ]; then printf 'ROLLBACK=already-restored\\n'; exit 0; fi
+test "$current" = "$expected" || { echo 'live sha256 changed after apply; rollback refused' >&2; exit 74; }
+test -f "$snap"
+test "$(run sha256sum "$snap" | awk '{print $1}')" = "$before"
+printf 'ROLLBACK=ready\\n'`;
+  const result = await sshRun(server.ssh, resolveSshSettings(server).sshKey, ['bash -s'], { input: script, timeout: 120000 });
+  if (result.status !== 0) { const error = new Error('rollback preflight: ' + (result.stderr || `exit ${result.status}`)); error.rollbackPreflight = true; throw error; }
+  return { ok: true, alreadyRestored: String(result.stdout || '').includes('ROLLBACK=already-restored') };
+}
+async function remoteRollbackConfig(server, transaction) {
+  const p = transaction.remote, preflight = await remoteRollbackPreflight(server, transaction);
+  if (preflight.alreadyRestored) return { ok: true, rows: [], fileOnly: true, alreadyRestored: true };
+  if (transaction.writeMode === 'helper') {
+    const command = `sudo -n ${shellQuote(REMOTE_CONFIG_HELPER)} rollback ${shellQuote(p.target)} ${shellQuote(transaction.id)} ${shellQuote(transaction.hashes.before)} ${shellQuote(transaction.hashes.target)}`;
     const result = await sshRun(server.ssh, resolveSshSettings(server).sshKey, [command], { timeout: 120000 });
     if (result.status !== 0) throw new Error('root helper rollback: ' + (result.stderr || `exit ${result.status}`));
     const live = await readLiveConfig(server, transaction.installRoot, transaction.path);
@@ -882,12 +918,17 @@ target=${shellQuote(p.target)}
 snap=${shellQuote(p.snapshot)}
 tmp=${shellQuote(p.temporary + '.rollback')}
 mode=${shellQuote(transaction.writeMode)}
+before=${shellQuote(transaction.hashes.before)}
+expected=${shellQuote(transaction.hashes.target)}
 run(){ if [ "$mode" = sudo ]; then sudo -n "$@"; else "$@"; fi; }
 cleanup(){ run rm -f -- "$tmp" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 test -f "$snap"
 actual=$(run sha256sum "$snap" | awk '{print $1}')
-test "$actual" = ${shellQuote(transaction.hashes.before)}
+test "$actual" = "$before"
+current=$(run sha256sum "$target" | awk '{print $1}')
+if [ "$current" = "$before" ]; then printf 'ROLLBACK=already-restored\\nRESTORED_SHA256=%s\\n' "$before"; exit 0; fi
+test "$current" = "$expected" || { echo 'live sha256 changed after apply; rollback refused' >&2; exit 74; }
 run cp --preserve=all -- "$snap" "$tmp"
 run mv -f -- "$tmp" "$target"
 trap - EXIT
@@ -1409,6 +1450,27 @@ const server = createServer(async (req, res) => {
       }
       const targetServer = findServer(batch.server);
       if (!targetServer) return json(res, 409, { ok: false, error: 'сервер batch видалений' });
+      const preflightFailures = [];
+      for (const row of [...(batch.files || [])].reverse()) {
+        try {
+          const transaction = loadConfigTransaction(row.transactionId);
+          if (['rolled-back', 'rolled-back-automatically'].includes(transaction.status)) continue;
+          if (transaction.batchId !== batch.id || transaction.server !== batch.server || transaction.group !== batch.group || !isConfigApplyTransactionKind(transaction.kind)) {
+            throw new Error('транзакція не належить цьому batch');
+          }
+          await remoteRollbackPreflight(targetServer, transaction);
+        } catch (e) {
+          preflightFailures.push({ path: row.path, error: String(e.message || e).slice(0, 1000),
+            requiresHelperUpdate: e.requiresHelperUpdate === true });
+          if (e.requiresHelperUpdate) break;
+        }
+      }
+      if (preflightFailures.length) {
+        const helperFailure = preflightFailures.find(item => item.requiresHelperUpdate);
+        return json(res, 409, { ok: false, error: `rollback preflight заблоковано для ${preflightFailures.length} файл(ів)`,
+          batchId: batch.id, failures: preflightFailures, requiresHelperUpdate: !!helperFailure,
+          helperPath: helperFailure?.path || null, status: batch.status });
+      }
       batch.status = 'rollback-in-progress';
       batch.rollbackStartedAt ||= new Date().toISOString();
       batch.rollbackAttempt = Number(batch.rollbackAttempt || 0) + 1;
@@ -1642,6 +1704,8 @@ const server = createServer(async (req, res) => {
         return json(res, 200, { ok: true, transactionId: transaction.id, status: transaction.status,
           hash: transaction.hashes.before, containers: transaction.rollbackHealth.rows });
       } catch (e) {
+        if (e.rollbackPreflight) return json(res, 409, { ok: false, error: e.message, transactionId: transaction.id,
+          status: transaction.status, requiresHelperUpdate: e.requiresHelperUpdate === true, helperPath: transaction.path });
         transaction.status = 'rollback-failed'; transaction.rollbackError = String(e.message || e).slice(0, 1000);
         saveConfigTransaction(transaction);
         return json(res, 500, { ok: false, error: transaction.rollbackError, transactionId: transaction.id, status: transaction.status });
@@ -2737,7 +2801,7 @@ function sev(row){ // 0 — найгостріше зверху
 let lastRows=[],lastData=null;
 const planDlg=document.getElementById('planDlg');
 let planFilter='all',planView=[],installerState={binding:null,refs:null,commits:[],snapshot:null,projects:null,currentPlan:null,scopeFiles:[]};
-const apiJson=async(url,options)=>{const r=await fetch(url,options);const j=await r.json();if(!r.ok||j.error)throw new Error(j.error||('HTTP '+r.status));return j;};
+const apiJson=async(url,options)=>{const r=await fetch(url,options);const j=await r.json();if(!r.ok||j.error){const e=new Error(j.error||('HTTP '+r.status));Object.assign(e,j);throw e;}return j;};
 const permissionsDlg=document.getElementById('permissionsDlg');
 let permissionsRequest=null;
 function openPermissionsSetup({path,onSuccess}){
@@ -3083,7 +3147,7 @@ async function runConfigBatchRollback(batchId,total,detail,button,label='пак�
     const result=await apiJson('/api/reconcile/file/batch/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({batchId})});
     renderProgress(result.progress);
     detail.innerHTML='<div class="backup-state ok"><b>✓ Увесь пакет відновлено з T2.</b><br>Файлів: '+esc(result.progress&&result.progress.rolledBack||total)+' · контейнери не змінювалися.</div>';
-  }catch(e){detail.innerHTML='<div class="backup-state bad"><b>Пакетний rollback неповний.</b><br>'+esc(e.message)+'<br>Повторний запуск безпечно продовжить останній batch.</div>';button.disabled=false;}
+  }catch(e){button.disabled=false;if(e.requiresHelperUpdate){detail.innerHTML='<div class="backup-state warn"><b>Потрібне одноразове оновлення безпечного helper.</b><br>Новий helper перевіряє live SHA безпосередньо перед rollback і не дозволить затерти сторонню зміну.</div>';openPermissionsSetup({path:e.helperPath,onSuccess:()=>{detail.innerHTML='<div class="backup-state ok"><b>✓ Helper оновлено.</b> Повторюю rollback preflight…</div>';setTimeout(()=>button.click(),0);}});}else detail.innerHTML='<div class="backup-state bad"><b>Пакетний rollback не розпочато або неповний.</b><br>'+esc(e.message)+'<br>Повторний запуск безпечно перевірить і продовжить останній batch.</div>';}
   finally{polling=false;await pollingTask;}
 }
 function openCurrentPlan(){
