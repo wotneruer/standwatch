@@ -1,0 +1,39 @@
+# Dependencies and build output
+node_modules/
+_build/
+bin/
+obj/
+publish/
+*.exe
+*.dll
+*.pdb
+*.zip
+*.blob
+
+# Temporary offline WebView2 references required by the current desktop build.
+!DesktopHost/lib/*.dll
+
+# Generated portable payload
+PortableLauncher/payload.zip
+
+# Runtime state and secrets
+data/
+.env
+config.env
+*.key
+*.pem
+*.pfx
+
+# Local artifacts
+coverage/
+*.log
+*.part
+*.tmp
+*.standwatch-update
+
+# Editor and OS metadata
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "projects": [
+    {
+      "id": "project_poruch",
+      "name": "Poruch",
+      "installers": [
+        {
+          "id": "installer_mu2ezgv7q700a",
+          "name": "rs.core poruch",
+          "gitUrl": "https://gitlab.renome-smart.com/vpo/installer.git",
+          "projectPath": "vpo/installer",
+          "manifestRoot": "home"
+        }
+      ]
+    },
+    {
+      "id": "project_mu3ufstwpclwv",
+      "name": "Yetu",
+      "installers": [
+        {
+          "id": "installer_mu3v6ku6ejqku",
+          "name": "rs.core yetu",
+          "gitUrl": "https://gitlab.renome-smart.com/rscore/yetu/rscore-installer.git",
+          "projectPath": "rscore/yetu/rscore-installer",
+          "manifestRoot": "home"
+        },
+        {
+          "id": "installer_mu3v739gb2pxm",
+          "name": "retail yetu",
+          "gitUrl": "https://gitlab.renome-smart.com/rscore/yetu/retail-portal-installer.git",
+          "projectPath": "rscore/yetu/retail-portal-installer",
+          "manifestRoot": "home"
+        }
+      ]
+    }
+  ],
+  "serverProjects": {},
+  "installRoots": {
+    "Poruch QA|rscore|vpo/installer": "/usr/local/rscore"
+  },
+  "groupInstaller": {},
+  "updatedAt": "2026-09-18T11:25:45.839Z"
+}

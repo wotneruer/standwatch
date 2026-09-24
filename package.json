@@ -1,0 +1,10 @@
+{
+  "name": "standwatch",
+  "private": true,
+  "version": "0.0.0-baseline.20260924",
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}
+
