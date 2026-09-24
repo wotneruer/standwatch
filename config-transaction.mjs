@@ -71,3 +71,11 @@ export function selectTransactionBaseline(transactions, { server, group, path, l
   const latest = candidates[0];
   return latest && latest.expectedSha === liveSha256 ? latest : null;
 }
+
+const CONFIG_BATCH_KINDS = new Set(['config-file-batch', 'config-file-debug-batch']);
+
+export function selectLatestConfigBatch(batches, { server, group }) {
+  return [...(batches || [])]
+    .filter(value => value && CONFIG_BATCH_KINDS.has(value.kind) && value.server === server && value.group === group)
+    .sort((a, b) => String(b.completedAt || b.createdAt || '').localeCompare(String(a.completedAt || a.createdAt || '')))[0] || null;
+}

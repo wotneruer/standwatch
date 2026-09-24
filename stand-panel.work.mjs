@@ -33,7 +33,8 @@ import { reconcileYaml, lineDiff as yamlLineDiff, parseYaml } from './yaml-recon
 import { mergeTextHunks, redactMergeDecisions } from './file-merge.mjs';
 import { resolveVerifiedConfigBackup, extractBackupConfigText } from './backup-config-source.mjs';
 import { findAffectedContainers } from './config-apply-safety.mjs';
-import { transactionPaths, redactDecisions, containerHealth, assertTransactionId, isConfigApplyTransactionKind, selectTransactionBaseline } from './config-transaction.mjs';
+import { transactionPaths, redactDecisions, containerHealth, assertTransactionId, isConfigApplyTransactionKind, selectTransactionBaseline, selectLatestConfigBatch } from './config-transaction.mjs';
+import { collectServerRenameBlockers } from './server-state-safety.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // портативно — усе в data/ біля exe; у dev — звичні шляхи
@@ -742,6 +743,30 @@ function saveConfigTransaction(value) {
   writeFileSync(temporary, JSON.stringify(value, null, 2));
   renameSync(temporary, target);
 }
+function loadJsonRecords(directory) {
+  if (!existsSync(directory)) return [];
+  const values = [];
+  for (const file of readdirSync(directory).filter(name => name.endsWith('.json'))) {
+    try { values.push(JSON.parse(readFileSync(join(directory, file), 'utf8'))); }
+    catch { /* damaged records stay on disk but cannot authorize a rename */ }
+  }
+  return values;
+}
+function serverRenameBlockers(serverName, catalog) {
+  return collectServerRenameBlockers({
+    serverName,
+    catalog,
+    plans: loadJsonRecords(PLANS_DIR),
+    transactions: loadJsonRecords(CONFIG_TRANSACTIONS_DIR),
+  });
+}
+function renameBlockedResponse(res, serverName, catalog) {
+  const blockers = serverRenameBlockers(serverName, catalog);
+  if (!blockers.blocked) return false;
+  json(res, 409, { ok: false, code: 'SERVER_RENAME_BLOCKED_BY_HISTORY', blockers,
+    error: `Перейменування «${serverName}» заблоковано: plans ${blockers.plans}, transactions ${blockers.transactions}. До переходу на stable serverId rename зламає історію та rollback.` });
+  return true;
+}
 function loadConfigTransaction(id) {
   const path = transactionFile(id);
   if (!existsSync(path)) throw new Error('транзакцію не знайдено');
@@ -1320,27 +1345,22 @@ const server = createServer(async (req, res) => {
     if (url.pathname === '/api/reconcile/file/batch/latest' && req.method === 'GET') {
       const targetServer = findServer(url.searchParams.get('server'));
       if (!targetServer) return json(res, 404, { ok: false, error: 'сервер не знайдено' });
-      const group = String(url.searchParams.get('group') || 'rscore'), batches = [];
-      if (existsSync(CONFIG_TRANSACTIONS_DIR)) {
-        for (const file of readdirSync(CONFIG_TRANSACTIONS_DIR).filter(name => name.endsWith('.json'))) {
-          try {
-            const value = JSON.parse(readFileSync(join(CONFIG_TRANSACTIONS_DIR, file), 'utf8'));
-            if (['config-file-batch', 'config-file-debug-batch'].includes(value.kind) && value.server === targetServer.name && value.group === group && value.status === 'applied') batches.push(value);
-          } catch { /* ignore damaged journal */ }
-        }
+      const group = String(url.searchParams.get('group') || 'rscore');
+      const batch = selectLatestConfigBatch(loadJsonRecords(CONFIG_TRANSACTIONS_DIR), { server: targetServer.name, group });
+      if (!batch || batch.status !== 'applied') {
+        return json(res, 200, { ok: true, available: false,
+          latestBatchId: batch?.id || null, latestBatchStatus: batch?.status || null });
       }
-      batches.sort((a, b) => String(b.completedAt || b.createdAt || '').localeCompare(String(a.completedAt || a.createdAt || '')));
-      for (const batch of batches) {
-        const files = [];
-        for (const row of batch.files || []) {
-          try {
-            const transaction = loadConfigTransaction(row.transactionId);
-            if (isConfigApplyTransactionKind(transaction.kind) && ['applied', 'rollback-failed'].includes(transaction.status)) files.push({ path: transaction.path, transactionId: transaction.id, status: transaction.status });
-          } catch { /* incomplete row is not rollbackable */ }
-        }
-        if (files.length) return json(res, 200, { ok: true, available: true, batchId: batch.id, debug: batch.kind === 'config-file-debug-batch', completedAt: batch.completedAt, files });
+      const files = [];
+      for (const row of batch.files || []) {
+        try {
+          const transaction = loadConfigTransaction(row.transactionId);
+          if (isConfigApplyTransactionKind(transaction.kind) && ['applied', 'rollback-failed'].includes(transaction.status)) files.push({ path: transaction.path, transactionId: transaction.id, status: transaction.status });
+        } catch { /* incomplete row is not rollbackable */ }
       }
-      return json(res, 200, { ok: true, available: false });
+      if (!files.length) return json(res, 200, { ok: true, available: false, latestBatchId: batch.id, latestBatchStatus: 'no-active-files' });
+      return json(res, 200, { ok: true, available: true, batchId: batch.id,
+        debug: batch.kind === 'config-file-debug-batch', completedAt: batch.completedAt, files });
     }
     if (url.pathname === '/api/reconcile/file/batch/apply' && req.method === 'POST') {
       const body = await readBody(req);
@@ -1708,6 +1728,7 @@ const server = createServer(async (req, res) => {
       if (!s) return json(res, 400, { error: 'сервер не знайдено' });
       if (cfg.servers.some(x => x.name === newN)) return json(res, 400, { error: 'така назва вже є' });
       const catalog = loadInstallerCatalog();
+      if (renameBlockedResponse(res, oldN, catalog)) return;
       s.name = newN;
       if (cfg.default === oldN) cfg.default = newN;
       saveServers(cfg);
@@ -1739,6 +1760,7 @@ const server = createServer(async (req, res) => {
       if (newN && newN !== cur) {
         if (cfg.servers.some(x => x.name === newN)) return json(res, 400, { error: 'така назва вже є' });
         const catalog = loadInstallerCatalog();
+        if (renameBlockedResponse(res, cur, catalog)) return;
         s.name = newN;
         if (cfg.default === cur) cfg.default = newN;
         if (catalog.serverProjects[cur]) { catalog.serverProjects[newN] = catalog.serverProjects[cur]; delete catalog.serverProjects[cur]; }

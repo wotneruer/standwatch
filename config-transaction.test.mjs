@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { assertRemoteConfigPath, transactionPaths, redactDecisions, containerHealth, isConfigApplyTransactionKind, selectTransactionBaseline } from './config-transaction.mjs';
+import { assertRemoteConfigPath, transactionPaths, redactDecisions, containerHealth, isConfigApplyTransactionKind, selectTransactionBaseline, selectLatestConfigBatch } from './config-transaction.mjs';
 
 test('transaction paths stay beside the target', () => {
   assert.deepEqual(transactionPaths('/usr/local/rscore/volumes/config/appsettings.json', 'tx_123'), {
@@ -59,4 +59,20 @@ test('DEBUG file transaction is eligible for rollback and becomes a verified bas
   const value = { kind: 'config-file-debug-apply', server: 's', group: 'g', path: 'a.json', status: 'applied', completedAt: '2026-01-05', hashes: { before, target } };
   assert.equal(isConfigApplyTransactionKind(value.kind), true);
   assert.equal(selectTransactionBaseline([value], { server: 's', group: 'g', path: 'a.json', liveSha256: target })?.expectedSha, target);
+});
+
+test('latest config batch never falls back to an older applied package', () => {
+  const latest = selectLatestConfigBatch([
+    { id: 'older', kind: 'config-file-batch', server: 'QA', group: 'rscore', status: 'applied', completedAt: '2026-09-20T10:00:00Z' },
+    { id: 'newer', kind: 'config-file-debug-batch', server: 'QA', group: 'rscore', status: 'applied', completedAt: '2026-09-21T10:00:00Z' },
+  ], { server: 'QA', group: 'rscore' });
+  assert.equal(latest.id, 'newer');
+});
+
+test('latest config batch includes terminal operations so UI cannot silently step backwards', () => {
+  const latest = selectLatestConfigBatch([
+    { id: 'older-active', kind: 'config-file-batch', server: 'QA', group: 'rscore', status: 'applied', completedAt: '2026-09-20T10:00:00Z' },
+    { id: 'newer-rolled-back', kind: 'config-file-batch', server: 'QA', group: 'rscore', status: 'rolled-back', completedAt: '2026-09-21T10:00:00Z' },
+  ], { server: 'QA', group: 'rscore' });
+  assert.equal(latest.id, 'newer-rolled-back');
 });
